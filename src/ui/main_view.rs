@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::*;
-use crate::types::{time_ago, SPINNER};
+use crate::types::{time_ago, LocalStatus, StepStatus, SPINNER};
 
 pub fn draw(
     f: &mut Frame,
@@ -16,12 +16,11 @@ pub fn draw(
     let area = f.area();
     f.render_widget(Clear, area);
 
-    // Layout: tab bar (1) + main content + footer (1) + notification (1 if present)
     let footer_height = if notification.is_some() { 2 } else { 1 };
     let chunks = Layout::vertical([
-        Constraint::Length(1),         // tab bar
-        Constraint::Min(3),            // content
-        Constraint::Length(footer_height), // footer
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(footer_height),
     ])
     .split(area);
 
@@ -68,7 +67,7 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, active: Tab) {
 
 fn draw_droplets_tab(f: &mut Frame, area: Rect, ds: &DropletsState, spin: usize) {
     let chunks =
-        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).split(area);
+        Layout::horizontal([Constraint::Percentage(25), Constraint::Percentage(75)]).split(area);
 
     draw_droplets_list(f, chunks[0], ds, spin);
     draw_droplet_detail(f, chunks[1], ds, spin);
@@ -90,24 +89,48 @@ fn draw_droplets_list(f: &mut Frame, area: Rect, ds: &DropletsState, spin: usize
     f.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
+    let views = ds.registry.views();
 
-    // Droplets
-    for (i, d) in ds.items.iter().enumerate() {
+    for (i, view) in views.iter().enumerate() {
         let is_selected = i == ds.selected && focused;
-        let is_deleting = ds.deleting.contains(&d.id);
 
-        let (icon, icon_color) = if is_deleting {
-            (SPINNER[spin], Color::Yellow)
-        } else if d.status == "active" {
-            ("●", Color::Green)
-        } else {
-            (SPINNER[spin], Color::Yellow)
+        let (icon, icon_color) = match view.local_status {
+            LocalStatus::Creating => (SPINNER[spin], Color::Yellow),
+            LocalStatus::Deleting => (SPINNER[spin], Color::Yellow),
+            LocalStatus::Normal => {
+                if let Some(api) = &view.api {
+                    if api.status == "active" {
+                        if view.provision.is_done() {
+                            ("●", Color::Green)
+                        } else if view.provision.error.is_some() {
+                            ("●", Color::Red)
+                        } else {
+                            (SPINNER[spin], Color::Cyan)
+                        }
+                    } else {
+                        (SPINNER[spin], Color::Yellow)
+                    }
+                } else {
+                    ("?", Color::DarkGray)
+                }
+            }
         };
 
-        let status_text = if is_deleting {
-            "(destroying)".to_string()
-        } else {
-            format!("({})", d.status)
+        let status_text = match view.local_status {
+            LocalStatus::Creating => "(creating)".to_string(),
+            LocalStatus::Deleting => "(destroying)".to_string(),
+            LocalStatus::Normal => {
+                if let Some(api) = &view.api {
+                    if api.status == "active" {
+                        let label = view.provision.overall_label();
+                        format!("({})", label)
+                    } else {
+                        format!("({})", api.status)
+                    }
+                } else {
+                    String::new()
+                }
+            }
         };
 
         let name_style = if is_selected {
@@ -120,43 +143,19 @@ fn draw_droplets_list(f: &mut Frame, area: Rect, ds: &DropletsState, spin: usize
 
         lines.push(Line::from(vec![
             Span::styled(format!(" {icon} "), Style::default().fg(icon_color)),
-            Span::styled(&d.name, name_style),
+            Span::styled(view.name.clone(), name_style),
             Span::raw(" "),
             Span::styled(status_text, Style::default().fg(Color::DarkGray)),
         ]));
     }
 
-    // Creating
-    let creating_start = ds.items.len();
-    for (i, name) in ds.creating.iter().enumerate() {
-        let idx = creating_start + i;
-        let is_selected = idx == ds.selected && focused;
-
-        let name_style = if is_selected {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default().fg(Color::White)
-        };
-
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {} ", SPINNER[spin]),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::styled(name.as_str(), name_style),
-            Span::styled(" (creating)", Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-
     // Separator
-    if !ds.items.is_empty() || !ds.creating.is_empty() {
+    if !views.is_empty() {
         lines.push(Line::raw(""));
     }
 
     // Create option
-    let create_idx = ds.items.len() + ds.creating.len();
+    let create_idx = views.len();
     let is_create_selected = create_idx == ds.selected && focused;
     let create_style = if is_create_selected {
         Style::default()
@@ -171,7 +170,7 @@ fn draw_droplets_list(f: &mut Frame, area: Rect, ds: &DropletsState, spin: usize
     ]));
 
     // Loading indicator
-    if ds.loading && ds.items.is_empty() && ds.creating.is_empty() {
+    if ds.loading && views.is_empty() {
         lines.insert(
             0,
             Line::from(vec![
@@ -187,34 +186,20 @@ fn draw_droplets_list(f: &mut Frame, area: Rect, ds: &DropletsState, spin: usize
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+// ── Detail: 3 bordered sub-windows ──────────────────────────────────────────
+
 fn draw_droplet_detail(f: &mut Frame, area: Rect, ds: &DropletsState, spin: usize) {
-    let focused = ds.focus == DFocus::Detail;
-    let border_style = if focused {
-        Style::default().fg(Color::White)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+    let selected_view = ds.registry.get_by_index(ds.selected);
 
-    let selected_droplet = if ds.selected < ds.items.len() {
-        Some(&ds.items[ds.selected])
-    } else {
-        None
-    };
+    if selected_view.is_none() {
+        let border_style = Style::default().fg(Color::DarkGray);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Selected Droplet ")
+            .border_style(border_style);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
 
-    let title = match selected_droplet {
-        Some(d) => format!(" {} ", d.name),
-        None => " Selected Droplet ".to_string(),
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(border_style);
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let Some(d) = selected_droplet else {
         let msg = if ds.loading {
             format!("{} Loading...", SPINNER[spin])
         } else {
@@ -228,56 +213,102 @@ fn draw_droplet_detail(f: &mut Frame, area: Rect, ds: &DropletsState, spin: usiz
             r,
         );
         return;
-    };
+    }
 
-    let is_deleting = ds.deleting.contains(&d.id);
+    let view = selected_view.unwrap();
+
+    // Split into 3 columns
+    let cols = Layout::horizontal([
+        Constraint::Percentage(30),
+        Constraint::Percentage(30),
+        Constraint::Percentage(40),
+    ])
+    .split(area);
+
+    draw_detail_info_window(f, cols[0], view, ds, spin);
+    draw_detail_provision_window(f, cols[1], view, ds, spin);
+    draw_detail_log_window(f, cols[2], view, ds, spin);
+}
+
+fn draw_detail_info_window(
+    f: &mut Frame,
+    area: Rect,
+    view: &crate::types::DropletView,
+    ds: &DropletsState,
+    spin: usize,
+) {
+    let focused = ds.focus == DFocus::DetailInfo;
+    let border_style = if focused {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Machine ")
+        .border_style(border_style);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::raw(""));
 
-    if let Some(ref ip) = d.ip {
-        lines.push(Line::from(vec![
-            Span::styled("  IP:      ", Style::default().fg(Color::DarkGray)),
-            Span::styled(ip.as_str(), Style::default().fg(Color::Cyan)),
-        ]));
-    }
-    lines.push(Line::from(vec![
-        Span::styled("  Status:  ", Style::default().fg(Color::DarkGray)),
-        if is_deleting {
-            Span::styled(
+    if let Some(api) = &view.api {
+        if let Some(ref ip) = api.ip {
+            lines.push(Line::from(vec![
+                Span::styled(" IP:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(ip.as_str(), Style::default().fg(Color::Cyan)),
+            ]));
+        }
+
+        let do_status_span = match view.local_status {
+            LocalStatus::Deleting => Span::styled(
                 format!("{} destroying", SPINNER[spin]),
                 Style::default().fg(Color::Yellow),
-            )
-        } else if d.status == "active" {
-            Span::styled("active", Style::default().fg(Color::Green))
-        } else {
-            Span::styled(&d.status, Style::default().fg(Color::Yellow))
-        },
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  Region:  ", Style::default().fg(Color::DarkGray)),
-        Span::raw(&d.region),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  Size:    ", Style::default().fg(Color::DarkGray)),
-        Span::raw(&d.size),
-    ]));
+            ),
+            _ => {
+                if api.status == "active" {
+                    Span::styled("active", Style::default().fg(Color::Green))
+                } else {
+                    Span::styled(api.status.clone(), Style::default().fg(Color::Yellow))
+                }
+            }
+        };
 
-    let ago = time_ago(&d.created_at);
-    if !ago.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("  Created: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(ago),
+            Span::styled(" DO:  ", Style::default().fg(Color::DarkGray)),
+            do_status_span,
         ]));
+        lines.push(Line::from(vec![
+            Span::styled(" Rgn: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(api.region.clone()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(" Size:", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(" {}", api.size)),
+        ]));
+
+        let ago = time_ago(&api.created_at);
+        if !ago.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(" Age: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(ago),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            format!(" {} Waiting for API...", SPINNER[spin]),
+            Style::default().fg(Color::Yellow),
+        )]));
     }
 
-    // Actions (only when focused and not deleting)
-    if !is_deleting {
+    // ── Actions ──
+    let is_deleting = view.local_status == LocalStatus::Deleting;
+    if !is_deleting && view.api.is_some() {
         lines.push(Line::raw(""));
 
         let mut action_idx = 0;
 
-        if d.ip.is_some() {
+        if view.api.as_ref().and_then(|a| a.ip.as_ref()).is_some() {
             let style = if focused && ds.detail_selected == action_idx {
                 Style::default()
                     .fg(Color::White)
@@ -286,8 +317,8 @@ fn draw_droplet_detail(f: &mut Frame, area: Rect, ds: &DropletsState, spin: usiz
                 Style::default().fg(Color::White)
             };
             lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("Copy SSH command", style),
+                Span::raw(" "),
+                Span::styled("Copy SSH cmd", style),
             ]));
             action_idx += 1;
         }
@@ -300,9 +331,184 @@ fn draw_droplet_detail(f: &mut Frame, area: Rect, ds: &DropletsState, spin: usiz
             Style::default().fg(Color::Red)
         };
         lines.push(Line::from(vec![
-            Span::raw("  "),
+            Span::raw(" "),
             Span::styled("Delete droplet", del_style),
         ]));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_detail_provision_window(
+    f: &mut Frame,
+    area: Rect,
+    view: &crate::types::DropletView,
+    ds: &DropletsState,
+    spin: usize,
+) {
+    let focused = ds.focus == DFocus::DetailProvision;
+    let border_style = if focused {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Provisioning ")
+        .border_style(border_style);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    for (i, step) in view.provision.steps.iter().enumerate() {
+        let (icon, color) = match &step.status {
+            StepStatus::Pending => ("○", Color::DarkGray),
+            StepStatus::Running => (SPINNER[spin], Color::Cyan),
+            StepStatus::Done => ("✓", Color::Green),
+            StepStatus::Failed(_) => ("✗", Color::Red),
+        };
+
+        let is_step_selected = focused && i == ds.provision_selected;
+
+        let name_color = if is_step_selected {
+            Color::White
+        } else {
+            match &step.status {
+                StepStatus::Pending => Color::DarkGray,
+                StepStatus::Running => Color::White,
+                StepStatus::Done => Color::Green,
+                StepStatus::Failed(_) => Color::Red,
+            }
+        };
+
+        let name_style = if is_step_selected {
+            Style::default()
+                .fg(name_color)
+                .add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(name_color)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {icon} "), Style::default().fg(color)),
+            Span::styled(step.name, name_style),
+        ]));
+
+        if let StepStatus::Failed(err) = &step.status {
+            let max_w = inner.width.saturating_sub(6) as usize;
+            let display = if err.len() > max_w {
+                format!("     {}…", &err[..max_w.saturating_sub(1)])
+            } else {
+                format!("     {err}")
+            };
+            lines.push(Line::styled(display, Style::default().fg(Color::Red)));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_detail_log_window(
+    f: &mut Frame,
+    area: Rect,
+    view: &crate::types::DropletView,
+    ds: &DropletsState,
+    spin: usize,
+) {
+    // Determine which step's logs to show
+    let step_idx = if ds.focus == DFocus::DetailProvision {
+        ds.provision_selected
+    } else {
+        view.provision.most_recent_step()
+    };
+
+    let step_name = view
+        .provision
+        .steps
+        .get(step_idx)
+        .map(|s| s.name)
+        .unwrap_or("Log");
+
+    let focused = false; // Log window is not directly navigable
+    let border_style = if focused {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {step_name} "))
+        .border_style(border_style);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Show error banner if provisioning failed on this step
+    if let Some(step) = view.provision.steps.get(step_idx) {
+        if let StepStatus::Failed(ref err) = step.status {
+            lines.push(Line::styled(
+                " ERROR:",
+                Style::default().fg(Color::Red),
+            ));
+            let err_width = inner.width.saturating_sub(2) as usize;
+            let err_text = err.trim();
+            for chunk in err_text.as_bytes().chunks(err_width.max(1)) {
+                let s = String::from_utf8_lossy(chunk);
+                lines.push(Line::styled(
+                    format!(" {s}"),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            lines.push(Line::raw(""));
+        }
+    }
+
+    let step_logs = view.provision.step_logs.get(step_idx);
+    let log_lines = step_logs.map(|l| l.as_slice()).unwrap_or(&[]);
+
+    if log_lines.is_empty() {
+        let is_running = view
+            .provision
+            .steps
+            .get(step_idx)
+            .map(|s| s.status == StepStatus::Running)
+            .unwrap_or(false);
+
+        if is_running {
+            lines.push(Line::from(vec![Span::styled(
+                format!(" {} Waiting for output...", SPINNER[spin]),
+                Style::default().fg(Color::DarkGray),
+            )]));
+        } else if view.provision.is_done() {
+            lines.push(Line::styled(
+                " All steps completed.",
+                Style::default().fg(Color::Green),
+            ));
+        } else {
+            lines.push(Line::styled(
+                " No output yet.",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    } else {
+        let used = lines.len() as u16;
+        let max_lines = inner.height.saturating_sub(used) as usize;
+        let log_width = inner.width.saturating_sub(2) as usize;
+        let start = log_lines.len().saturating_sub(max_lines);
+        for log_line in &log_lines[start..] {
+            let trimmed = log_line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let display = if trimmed.len() > log_width {
+                format!(" {}…", &trimmed[..log_width.saturating_sub(2)])
+            } else {
+                format!(" {trimmed}")
+            };
+            lines.push(Line::styled(display, Style::default().fg(Color::DarkGray)));
+        }
     }
 
     f.render_widget(Paragraph::new(lines), inner);
@@ -356,7 +562,6 @@ fn draw_config_panel(
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw(""));
 
-    // Status
     let (icon, icon_color, status_text) = match info.status {
         KeyStatus::Unknown => ("?", Color::DarkGray, "Unknown"),
         KeyStatus::Checking => (SPINNER[spin], Color::Yellow, "Checking..."),
@@ -366,10 +571,7 @@ fn draw_config_panel(
     lines.push(Line::from(vec![
         Span::styled("  Status: ", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
-        Span::styled(
-            status_text,
-            Style::default().fg(icon_color),
-        ),
+        Span::styled(status_text, Style::default().fg(icon_color)),
     ]));
 
     if let Some(ref msg) = info.message {
@@ -381,7 +583,6 @@ fn draw_config_panel(
 
     lines.push(Line::raw(""));
 
-    // Actions
     let actions = ["Set up again", "Test now"];
     for (i, action) in actions.iter().enumerate() {
         let style = if focused && info.selected == i {
@@ -404,7 +605,6 @@ fn draw_config_panel(
 
     lines.push(Line::raw(""));
 
-    // Next check countdown
     let secs = (info.next_check as f64 * 0.1).ceil() as u32;
     lines.push(Line::styled(
         format!("  Next check in {secs}s"),
@@ -424,20 +624,27 @@ fn draw_footer(
 ) {
     let mut lines: Vec<Line> = Vec::new();
 
-    // Keybindings
     let bindings: Vec<(&str, &str)> = match state.tab {
         Tab::Droplets => match state.droplets.focus {
             DFocus::List => vec![
                 ("↑↓", "navigate"),
                 ("Enter/→", "select"),
+                ("D", "delete"),
                 ("Tab", "config"),
                 ("q", "quit"),
             ],
-            DFocus::Detail => vec![
+            DFocus::DetailInfo => vec![
                 ("↑↓", "navigate"),
                 ("Enter", "action"),
+                ("→", "provisioning"),
+                ("D", "delete"),
                 ("←/Esc", "back"),
-                ("Tab", "config"),
+                ("q", "quit"),
+            ],
+            DFocus::DetailProvision => vec![
+                ("↑↓", "select step"),
+                ("←", "back"),
+                ("D", "delete"),
                 ("q", "quit"),
             ],
         },
@@ -465,7 +672,6 @@ fn draw_footer(
     }
     lines.push(Line::from(spans));
 
-    // Notification
     if let Some((msg, _)) = notification {
         lines.push(Line::styled(
             format!(" {msg}"),

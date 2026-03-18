@@ -273,13 +273,6 @@ pub fn draw(f: &mut Frame, state: &WelcomeState, spin: usize) {
                 Style::default().fg(Color::DarkGray),
             ));
         }
-
-        WelcomePhase::AllReady => {
-            lines.push(Line::from(vec![
-                Span::styled("  ✓ ", Style::default().fg(Color::Green)),
-                Span::raw("All set!"),
-            ]));
-        }
     }
 
     // Render content

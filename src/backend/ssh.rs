@@ -162,8 +162,383 @@ pub fn copy_to_clipboard(text: &str) -> bool {
     }
 }
 
-pub fn get_public_key(key_path: &str) -> Result<String> {
-    let pub_path = format!("{key_path}.pub");
-    let content = std::fs::read_to_string(&pub_path)?;
-    Ok(content.trim().to_string())
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Strip ANSI escape sequences and control characters from a line.
+fn sanitize_line(line: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut in_escape = false;
+    for c in line.chars() {
+        if in_escape {
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+            continue;
+        }
+        if c == '\x1b' {
+            in_escape = true;
+            continue;
+        }
+        if c == '\r' || (c.is_control() && c != '\t') {
+            continue;
+        }
+        result.push(c);
+    }
+    result
+}
+
+// ── Provisioning commands ───────────────────────────────────────────────────
+
+/// Run a command on a remote droplet via SSH (no logging).
+fn ssh_run(droplet_key: &str, ip: &str, cmd: &str) -> Result<String> {
+    let output = Command::new("ssh")
+        .stdin(Stdio::null())
+        .arg("-i")
+        .arg(droplet_key)
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("ConnectTimeout=15")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(format!("root@{ip}"))
+        .arg(cmd)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!("{}{}", stderr, stdout);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Run a command on a remote droplet via SSH, streaming stdout+stderr line by line.
+fn ssh_run_logged(
+    droplet_key: &str,
+    ip: &str,
+    cmd: &str,
+    on_line: &dyn Fn(&str),
+) -> Result<String> {
+    use std::io::BufRead;
+
+    on_line(&format!("$ ssh root@{ip} '{cmd}'"));
+
+    let mut child = Command::new("ssh")
+        .stdin(Stdio::null())
+        .arg("-i")
+        .arg(droplet_key)
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("ConnectTimeout=15")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ServerAliveInterval=30")
+        .arg("-o")
+        .arg("ServerAliveCountMax=10")
+        .arg(format!("root@{ip}"))
+        // Wrap in subshell so 2>&1 captures stderr from the entire command,
+        // including compound commands like `cmd1 || true`
+        .arg(format!("( {cmd} ) 2>&1"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    // Read local stderr in a background thread (SSH connection errors go here)
+    let stderr_handle = std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        let mut lines = Vec::new();
+        for line in reader.lines().flatten() {
+            lines.push(line);
+        }
+        lines
+    });
+
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut all_output = String::new();
+
+    // Read byte-by-byte into segments split on \n or \r, so we capture
+    // progress output from git/apt/curl that uses \r to update in-place.
+    let mut buf = Vec::with_capacity(1024);
+    loop {
+        use std::io::Read;
+        let mut byte = [0u8; 1];
+        match reader.read(&mut byte) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                let b = byte[0];
+                if b == b'\n' || b == b'\r' {
+                    if !buf.is_empty() {
+                        let raw = String::from_utf8_lossy(&buf).to_string();
+                        let clean = sanitize_line(&raw);
+                        if !clean.trim().is_empty() {
+                            on_line(&clean);
+                        }
+                        all_output.push_str(&raw);
+                        all_output.push('\n');
+                        buf.clear();
+                    }
+                } else {
+                    buf.push(b);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    // Flush remaining
+    if !buf.is_empty() {
+        let raw = String::from_utf8_lossy(&buf).to_string();
+        let clean = sanitize_line(&raw);
+        if !clean.trim().is_empty() {
+            on_line(&clean);
+        }
+        all_output.push_str(&raw);
+        all_output.push('\n');
+    }
+
+    // Collect local stderr lines (SSH connection errors) and add to output
+    let stderr_lines = stderr_handle.join().unwrap_or_default();
+    for line in &stderr_lines {
+        let clean = sanitize_line(line);
+        if !clean.trim().is_empty() {
+            on_line(&clean);
+        }
+        all_output.push_str(line);
+        all_output.push('\n');
+    }
+
+    let status = child.wait()?;
+    if !status.success() {
+        bail!(
+            "exit {}: {}",
+            status.code().unwrap_or(-1),
+            all_output.trim()
+        );
+    }
+
+    Ok(all_output)
+}
+
+// ── Provision marker system ─────────────────────────────────────────────────
+
+fn write_provision_marker(droplet_key: &str, ip: &str, step_idx: usize) -> Result<()> {
+    ssh_run(
+        droplet_key,
+        ip,
+        &format!("mkdir -p /root/.droplets && touch /root/.droplets/step-{step_idx}.done"),
+    )?;
+    Ok(())
+}
+
+pub fn check_provision_markers(
+    droplet_key: &str,
+    ip: &str,
+    total_steps: usize,
+) -> Result<Vec<bool>> {
+    let output = ssh_run(droplet_key, ip, "ls /root/.droplets/ 2>/dev/null || echo ''")?;
+    let mut results = vec![false; total_steps];
+    for i in 0..total_steps {
+        if output.contains(&format!("step-{i}.done")) {
+            results[i] = true;
+        }
+    }
+    Ok(results)
+}
+
+// ── Provisioning steps ──────────────────────────────────────────────────────
+
+/// Step 0: Copy the GitHub SSH key to the droplet.
+pub fn provision_transport_github_key(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    let cfg = config::load();
+    let github_key_path = cfg
+        .github_ssh_key_path
+        .ok_or_else(|| anyhow::anyhow!("No GitHub SSH key configured"))?;
+
+    let private_key = std::fs::read_to_string(&github_key_path)?;
+    let pub_path = format!("{github_key_path}.pub");
+    let public_key = std::fs::read_to_string(&pub_path)?;
+
+    let escaped_priv = private_key.replace('\'', "'\\''");
+    let escaped_pub = public_key.trim().replace('\'', "'\\''");
+
+    let script = format!(
+        "mkdir -p ~/.ssh && \
+         echo '{escaped_priv}' > ~/.ssh/github_key && \
+         chmod 600 ~/.ssh/github_key && \
+         echo '{escaped_pub}' > ~/.ssh/github_key.pub && \
+         chmod 644 ~/.ssh/github_key.pub && \
+         echo 'Host github.com\n  IdentityFile ~/.ssh/github_key\n  StrictHostKeyChecking accept-new' > ~/.ssh/config && \
+         chmod 600 ~/.ssh/config"
+    );
+
+    ssh_run_logged(droplet_key, ip, &script, on_log)?;
+    write_provision_marker(droplet_key, ip, 0)?;
+    Ok(())
+}
+
+/// Step 1: Verify the GitHub SSH key works from the droplet.
+pub fn provision_verify_github_key(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    // ssh -T git@github.com exits with code 1 even on success, so use || true
+    let output = ssh_run_logged(
+        droplet_key,
+        ip,
+        "ssh -o StrictHostKeyChecking=accept-new -T git@github.com || true",
+        on_log,
+    )?;
+    if !output.contains("successfully authenticated") && !output.contains("You've successfully") {
+        bail!("GitHub SSH verification failed: {}", output.trim());
+    }
+    write_provision_marker(droplet_key, ip, 1)?;
+    Ok(())
+}
+
+/// Step 2: Install Docker.
+pub fn provision_install_docker(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    ssh_run_logged(droplet_key, ip, "curl -fsSL https://get.docker.com | sh", on_log)?;
+    write_provision_marker(droplet_key, ip, 2)?;
+    Ok(())
+}
+
+/// Step 3: Verify Docker.
+pub fn provision_verify_docker(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    let output = ssh_run_logged(droplet_key, ip, "docker --version && docker ps", on_log)?;
+    if !output.contains("Docker version") {
+        bail!("Docker version check failed");
+    }
+    write_provision_marker(droplet_key, ip, 3)?;
+    Ok(())
+}
+
+/// Step 4: Install Flox.
+pub fn provision_install_flox(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    ssh_run_logged(
+        droplet_key,
+        ip,
+        "wget -q https://downloads.flox.dev/by-env/stable/deb/flox-1.10.0.x86_64-linux.deb && \
+         sudo apt install -y ./flox-1.10.0.x86_64-linux.deb",
+        on_log,
+    )?;
+    write_provision_marker(droplet_key, ip, 4)?;
+    Ok(())
+}
+
+/// Step 5: Verify Flox.
+pub fn provision_verify_flox(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    let output = ssh_run_logged(droplet_key, ip, "flox --version", on_log)?;
+    if output.trim().is_empty() {
+        bail!("Flox not found");
+    }
+    write_provision_marker(droplet_key, ip, 5)?;
+    Ok(())
+}
+
+/// Step 6: Install build-essential.
+pub fn provision_install_build_essential(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    ssh_run_logged(
+        droplet_key,
+        ip,
+        "sudo apt install -y build-essential",
+        on_log,
+    )?;
+    write_provision_marker(droplet_key, ip, 6)?;
+    Ok(())
+}
+
+/// Step 7: Verify build-essential.
+pub fn provision_verify_build_essential(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    let output = ssh_run_logged(droplet_key, ip, "gcc --version", on_log)?;
+    if !output.contains("gcc") {
+        bail!("build-essential not installed properly");
+    }
+    write_provision_marker(droplet_key, ip, 7)?;
+    Ok(())
+}
+
+/// Step 8: Clone PostHog repo.
+pub fn provision_clone_posthog(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    ssh_run_logged(
+        droplet_key,
+        ip,
+        "cd /root && git clone --filter=blob:none https://github.com/PostHog/posthog",
+        on_log,
+    )?;
+    write_provision_marker(droplet_key, ip, 8)?;
+    Ok(())
+}
+
+/// Step 9: Verify PostHog clone.
+pub fn provision_verify_posthog_clone(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    let output = ssh_run_logged(
+        droplet_key,
+        ip,
+        "test -d /root/posthog/.git && echo 'posthog-clone-ok'",
+        on_log,
+    )?;
+    if !output.contains("posthog-clone-ok") {
+        bail!("PostHog repo not found at /root/posthog");
+    }
+    write_provision_marker(droplet_key, ip, 9)?;
+    Ok(())
+}
+
+/// Step 10: Activate Flox environment in PostHog dir.
+pub fn provision_flox_activate(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    ssh_run_logged(
+        droplet_key,
+        ip,
+        "cd /root/posthog && flox activate -- echo 'Flox environment ready'",
+        on_log,
+    )?;
+    write_provision_marker(droplet_key, ip, 10)?;
+    Ok(())
 }

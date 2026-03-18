@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+
+// ── Droplet with provisioning state ─────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct DropletInfo {
     pub id: i64,
@@ -8,6 +12,237 @@ pub struct DropletInfo {
     pub size: String,
     pub created_at: String,
 }
+
+/// Combined view of a droplet: API data + local overlay state.
+#[derive(Debug, Clone)]
+pub struct DropletView {
+    /// None if still waiting for the create API call to return
+    pub api: Option<DropletInfo>,
+    pub name: String,
+    pub local_status: LocalStatus,
+    pub provision: ProvisionState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocalStatus {
+    Normal,
+    Creating,  // We sent create, waiting for API / waiting for active
+    Deleting,  // We sent delete, waiting for it to disappear
+}
+
+/// Provisioning steps we run against a droplet after it becomes active.
+#[derive(Debug, Clone)]
+pub struct ProvisionState {
+    pub steps: Vec<ProvisionStep>,
+    pub current: Option<usize>,  // None = not started or all done
+    pub error: Option<String>,
+    pub step_logs: Vec<Vec<String>>,  // per-step log lines
+    pub needs_check: bool,  // SSH check needed to determine actual state
+}
+
+#[derive(Debug, Clone)]
+pub struct ProvisionStep {
+    pub name: &'static str,
+    pub status: StepStatus,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepStatus {
+    Pending,
+    Running,
+    Done,
+    Failed(String),
+}
+
+pub const PROVISION_STEP_NAMES: &[&str] = &[
+    "Transport GitHub SSH key",
+    "Verify GitHub SSH key",
+    "Install Docker",
+    "Verify Docker",
+    "Install Flox",
+    "Verify Flox",
+    "Install build-essential",
+    "Verify build-essential",
+    "Clone PostHog",
+    "Verify PostHog clone",
+    "Activate Flox environment",
+];
+
+impl ProvisionState {
+    pub fn new() -> Self {
+        let steps: Vec<ProvisionStep> = PROVISION_STEP_NAMES
+            .iter()
+            .map(|&name| ProvisionStep {
+                name,
+                status: StepStatus::Pending,
+            })
+            .collect();
+        let step_count = steps.len();
+        Self {
+            steps,
+            current: None,
+            error: None,
+            step_logs: vec![Vec::new(); step_count],
+            needs_check: false,
+        }
+    }
+
+    /// Index of the most relevant step to display (current running, or last non-pending).
+    pub fn most_recent_step(&self) -> usize {
+        if let Some(current) = self.current {
+            return current;
+        }
+        self.steps
+            .iter()
+            .rposition(|s| s.status != StepStatus::Pending)
+            .unwrap_or(0)
+    }
+
+    pub fn overall_label(&self) -> &'static str {
+        if self.error.is_some() {
+            return "provision failed";
+        }
+        if self.steps.iter().all(|s| s.status == StepStatus::Done) {
+            return "ready";
+        }
+        match self.current {
+            Some(i) => self.steps.get(i).map_or("provisioning", |s| s.name),
+            None => "pending",
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.steps.iter().all(|s| s.status == StepStatus::Done)
+    }
+}
+
+// ── Droplet registry: single source of truth ────────────────────────────────
+
+/// Merges API data with local state (creating/deleting overlays).
+/// Key insight: the API list is truth, but we overlay local knowledge.
+pub struct DropletRegistry {
+    /// Map from droplet name → view. We use name as key because creating
+    /// droplets don't have an ID yet.
+    pub views: Vec<DropletView>,
+}
+
+impl DropletRegistry {
+    pub fn new() -> Self {
+        Self { views: vec![] }
+    }
+
+    /// Merge fresh API data with local state. The rules:
+    /// - If a droplet is in local_status=Deleting, keep showing it as deleting
+    ///   until it disappears from the API response.
+    /// - If a droplet is in local_status=Creating, update its API data once
+    ///   the API returns it, but keep Creating until status="active".
+    /// - Once a creating droplet becomes active, move to Normal and start provisioning.
+    pub fn merge_api_data(&mut self, api_droplets: Vec<DropletInfo>) {
+        let api_by_name: HashMap<String, DropletInfo> =
+            api_droplets.into_iter().map(|d| (d.name.clone(), d)).collect();
+
+        // Update existing views
+        for view in self.views.iter_mut() {
+            if let Some(api) = api_by_name.get(&view.name) {
+                view.api = Some(api.clone());
+
+                match view.local_status {
+                    LocalStatus::Creating => {
+                        if api.status == "active" {
+                            view.local_status = LocalStatus::Normal;
+                            // Start provisioning if not already started
+                            if view.provision.current.is_none() && !view.provision.is_done() {
+                                view.provision.current = Some(0);
+                                view.provision.steps[0].status = StepStatus::Running;
+                            }
+                        }
+                    }
+                    LocalStatus::Deleting => {
+                        // Still in API, keep showing as deleting
+                    }
+                    LocalStatus::Normal => {
+                        // Just update API data
+                    }
+                }
+            } else {
+                // Not in API anymore
+                if view.local_status == LocalStatus::Deleting {
+                    // Good, it's been deleted. Mark for removal.
+                    view.local_status = LocalStatus::Normal;
+                    view.api = None; // signal for removal
+                }
+            }
+        }
+
+        // Remove views that are gone from API and not locally tracked
+        self.views.retain(|v| {
+            v.api.is_some() || v.local_status == LocalStatus::Creating
+        });
+
+        // Add new droplets from API that we don't have locally
+        let known_names: std::collections::HashSet<String> =
+            self.views.iter().map(|v| v.name.clone()).collect();
+        for (name, api) in api_by_name {
+            if !known_names.contains(&name) {
+                let is_active = api.status == "active";
+                let mut ps = ProvisionState::new();
+                if is_active {
+                    // Need to SSH in and check which steps actually completed
+                    ps.needs_check = true;
+                }
+                self.views.push(DropletView {
+                    name: name.clone(),
+                    api: Some(api),
+                    local_status: LocalStatus::Normal,
+                    provision: ps,
+                });
+            }
+        }
+    }
+
+    pub fn add_creating(&mut self, name: String) {
+        self.views.push(DropletView {
+            name,
+            api: None,
+            local_status: LocalStatus::Creating,
+            provision: ProvisionState::new(),
+        });
+    }
+
+    pub fn mark_deleting(&mut self, id: i64) {
+        if let Some(view) = self.views.iter_mut().find(|v| {
+            v.api.as_ref().map_or(false, |a| a.id == id)
+        }) {
+            view.local_status = LocalStatus::Deleting;
+        }
+    }
+
+    pub fn mark_create_failed(&mut self, name: &str) {
+        self.views.retain(|v| !(v.name == name && v.local_status == LocalStatus::Creating && v.api.is_none()));
+    }
+
+    pub fn views(&self) -> &[DropletView] {
+        &self.views
+    }
+
+    pub fn get_by_index(&self, idx: usize) -> Option<&DropletView> {
+        self.views.get(idx)
+    }
+
+    pub fn get_by_index_mut(&mut self, idx: usize) -> Option<&mut DropletView> {
+        self.views.get_mut(idx)
+    }
+
+    pub fn find_by_name_mut(&mut self, name: &str) -> Option<&mut DropletView> {
+        self.views.iter_mut().find(|v| v.name == name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.views.len()
+    }
+}
+
+// ── Static data ─────────────────────────────────────────────────────────────
 
 pub struct Region {
     pub slug: &'static str,
@@ -51,7 +286,6 @@ pub fn time_ago(iso_str: &str) -> String {
     if iso_str.is_empty() {
         return String::new();
     }
-    // Simple ISO 8601 parse: "2024-01-15T10:30:00Z"
     let iso = iso_str.replace('Z', "+00:00");
     let parts: Vec<&str> = iso.split('T').collect();
     if parts.len() != 2 {
@@ -75,7 +309,6 @@ pub fn time_ago(iso_str: &str) -> String {
         let mi: i64 = time_parts[1].parse().ok()?;
         let s: i64 = time_parts[2].split('.').next()?.parse().ok()?;
 
-        // Rough epoch calculation (good enough for "time ago")
         let days = (y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400;
         let month_days: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
         let mut day_sum = days;

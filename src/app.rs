@@ -1,16 +1,17 @@
-use std::collections::HashSet;
 use std::sync::mpsc::Sender;
 
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::backend::{config, digitalocean, ssh};
-use crate::types::{DropletInfo, MACHINES, REGIONS};
+use crate::types::{
+    DropletInfo, DropletRegistry, LocalStatus, StepStatus, MACHINES, PROVISION_STEP_NAMES, REGIONS,
+};
 
 // ── Tick constants (1 tick = ~100ms) ────────────────────────────────────────
 
-const AUTO_ADVANCE_TICKS: u32 = 15; // 1.5s
+const AUTO_ADVANCE_TICKS: u32 = 10; // 1s
 const CHECK_INTERVAL_TICKS: u32 = 50; // 5s
-const REFRESH_INTERVAL_TICKS: u32 = 50; // 5s
+const REFRESH_INTERVAL_TICKS: u32 = 30; // 3s (faster to catch status changes)
 
 // ── Messages from background tasks ─────────────────────────────────────────
 
@@ -26,12 +27,16 @@ pub enum Msg {
     DoKeyMissing,
     DoTestResult { success: bool, message: String },
 
-    // Main: Droplets
+    // Main: Droplets — single source: periodic API refresh
     DropletsLoaded(Vec<DropletInfo>),
-    DropletCreateDone { name: String },
     DropletCreateFailed { name: String, error: String },
-    DropletDeleted(i64),
     DropletDeleteFailed { id: i64, error: String },
+
+    // Provisioning
+    ProvisionStepDone { name: String, step_idx: usize },
+    ProvisionStepFailed { name: String, step_idx: usize, error: String },
+    ProvisionLog { name: String, step_idx: usize, line: String },
+    ProvisionStateChecked { name: String, completed_steps: Vec<bool> },
 
     // Main: Config health checks
     ConfigGithubCheck { success: bool, message: String },
@@ -45,7 +50,7 @@ pub struct App {
     pub should_quit: bool,
     pub spinner_idx: usize,
     pub tick_count: u64,
-    pub notification: Option<(String, u32)>, // (message, ticks remaining)
+    pub notification: Option<(String, u32)>,
 }
 
 pub enum Screen {
@@ -59,6 +64,14 @@ pub struct WelcomeState {
     pub phase: WelcomePhase,
     pub auto_advance: u32,
     pub github_done_msg: Option<String>,
+    // Parallel check: store DO result while GitHub is still in progress
+    pub do_early_result: Option<DoEarlyResult>,
+}
+
+pub enum DoEarlyResult {
+    Missing,
+    TestOk(String),
+    TestFailed(String),
 }
 
 pub enum WelcomePhase {
@@ -76,8 +89,6 @@ pub enum WelcomePhase {
     DoInput(TextInput),
     TestingDo,
     DoFailed(String),
-
-    AllReady,
 }
 
 // ── Main State ──────────────────────────────────────────────────────────────
@@ -96,12 +107,11 @@ pub enum Tab {
 }
 
 pub struct DropletsState {
-    pub items: Vec<DropletInfo>,
+    pub registry: DropletRegistry,
     pub selected: usize,
     pub focus: DFocus,
     pub detail_selected: usize,
-    pub creating: Vec<String>,
-    pub deleting: HashSet<i64>,
+    pub provision_selected: usize,
     pub refresh_countdown: u32,
     pub loading: bool,
 }
@@ -109,7 +119,8 @@ pub struct DropletsState {
 #[derive(PartialEq, Clone, Copy)]
 pub enum DFocus {
     List,
-    Detail,
+    DetailInfo,
+    DetailProvision,
 }
 
 pub struct ConfigViewState {
@@ -143,10 +154,7 @@ pub enum KeyStatus {
 
 pub enum Popup {
     CreateDroplet(CreatePopupState),
-    Confirm {
-        message: String,
-        action: PendingAction,
-    },
+    Confirm { message: String, action: PendingAction },
     GithubSetup(GithubSetupPhase),
     DoSetup(DoSetupPhase),
     Message(String),
@@ -258,6 +266,7 @@ impl App {
                 phase: WelcomePhase::CheckingGithub,
                 auto_advance: 0,
                 github_done_msg: None,
+                do_early_result: None,
             }),
             should_quit: false,
             spinner_idx: 0,
@@ -266,31 +275,41 @@ impl App {
         }
     }
 
-    /// Returns total item count for the droplets list (items + creating + separator + create option)
-    pub fn droplet_list_len(&self) -> usize {
-        if let Screen::Main(main) = &self.screen {
-            let base = main.droplets.items.len() + main.droplets.creating.len();
-            base + 1 // +1 for "+ Create new"
-        } else {
-            0
-        }
-    }
-
     pub fn start_initial_check(&self, tx: &Sender<Msg>) {
-        let tx = tx.clone();
+        // GitHub check
+        let tx1 = tx.clone();
         std::thread::spawn(move || {
             let cfg = config::load();
             match cfg.github_ssh_key_path {
                 Some(path) if std::path::Path::new(&path).exists() => {
                     let (ok, msg) = ssh::test_github_ssh_key(&path);
-                    tx.send(Msg::GithubTestResult {
+                    tx1.send(Msg::GithubTestResult {
                         success: ok,
                         message: msg,
                     })
                     .ok();
                 }
                 _ => {
-                    tx.send(Msg::GithubKeyMissing).ok();
+                    tx1.send(Msg::GithubKeyMissing).ok();
+                }
+            }
+        });
+        // DO check (in parallel)
+        let tx2 = tx.clone();
+        std::thread::spawn(move || {
+            let cfg = config::load();
+            match cfg.do_api_key {
+                Some(key) if !key.is_empty() => {
+                    tx2.send(Msg::DoKeyExists).ok();
+                    let (ok, msg) = ssh::test_do_api_key(&key);
+                    tx2.send(Msg::DoTestResult {
+                        success: ok,
+                        message: msg,
+                    })
+                    .ok();
+                }
+                _ => {
+                    tx2.send(Msg::DoKeyMissing).ok();
                 }
             }
         });
@@ -302,7 +321,6 @@ impl App {
         self.tick_count += 1;
         self.spinner_idx = (self.spinner_idx + 1) % 10;
 
-        // Decrement notification timer
         if let Some((_, ref mut ticks)) = self.notification {
             if *ticks > 0 {
                 *ticks -= 1;
@@ -311,7 +329,6 @@ impl App {
             }
         }
 
-        // Collect what needs to happen without holding mutable borrow
         let mut do_advance_welcome = false;
         let mut do_refresh_droplets = false;
         let mut do_check_github = false;
@@ -351,7 +368,6 @@ impl App {
             }
         }
 
-        // Now execute actions without conflicting borrows
         if do_advance_welcome {
             self.advance_welcome(tx);
         }
@@ -366,7 +382,7 @@ impl App {
         }
     }
 
-    fn advance_welcome(&mut self, tx: &Sender<Msg>) {
+    fn advance_welcome(&mut self, _tx: &Sender<Msg>) {
         if let Screen::Welcome(state) = &mut self.screen {
             match &state.phase {
                 WelcomePhase::GithubOk(_) => {
@@ -376,47 +392,44 @@ impl App {
                         String::new()
                     };
                     state.github_done_msg = Some(msg);
-                    state.phase = WelcomePhase::CheckingDo;
                     state.auto_advance = 0;
-                    // Start DO check
-                    let tx = tx.clone();
-                    std::thread::spawn(move || {
-                        let cfg = config::load();
-                        match cfg.do_api_key {
-                            Some(key) if !key.is_empty() => {
-                                tx.send(Msg::DoKeyExists).ok();
-                                let (ok, msg) = ssh::test_do_api_key(&key);
-                                tx.send(Msg::DoTestResult {
-                                    success: ok,
-                                    message: msg,
-                                })
-                                .ok();
-                            }
-                            _ => {
-                                tx.send(Msg::DoKeyMissing).ok();
-                            }
+
+                    // Use early DO result from parallel check if available
+                    match state.do_early_result.take() {
+                        Some(DoEarlyResult::TestOk(msg)) => {
+                            state.phase = WelcomePhase::DoOk(msg);
+                            state.auto_advance = AUTO_ADVANCE_TICKS;
                         }
-                    });
+                        Some(DoEarlyResult::TestFailed(msg)) => {
+                            state.phase = WelcomePhase::DoFailed(msg);
+                        }
+                        Some(DoEarlyResult::Missing) => {
+                            state.phase = WelcomePhase::DoMissing;
+                        }
+                        None => {
+                            // Parallel thread hasn't finished yet; it will deliver the result
+                            state.phase = WelcomePhase::CheckingDo;
+                        }
+                    }
                 }
-                WelcomePhase::DoOk(_) | WelcomePhase::AllReady => {
-                    self.transition_to_main(tx);
+                WelcomePhase::DoOk(_) => {
+                    self.transition_to_main();
                 }
                 _ => {}
             }
         }
     }
 
-    fn transition_to_main(&mut self, _tx: &Sender<Msg>) {
+    fn transition_to_main(&mut self) {
         self.screen = Screen::Main(MainState {
             tab: Tab::Droplets,
             droplets: DropletsState {
-                items: vec![],
+                registry: DropletRegistry::new(),
                 selected: 0,
                 focus: DFocus::List,
                 detail_selected: 0,
-                creating: vec![],
-                deleting: HashSet::new(),
-                refresh_countdown: 0, // load immediately
+                provision_selected: 0,
+                refresh_countdown: 0,
                 loading: true,
             },
             config: ConfigViewState {
@@ -425,7 +438,7 @@ impl App {
                     status: KeyStatus::Unknown,
                     message: None,
                     selected: 0,
-                    next_check: 0, // check immediately
+                    next_check: 0,
                 },
                 digitalocean: KeyCheckInfo {
                     status: KeyStatus::Unknown,
@@ -441,7 +454,6 @@ impl App {
     // ── Handle Key ──────────────────────────────────────────────────────────
 
     pub fn handle_key(&mut self, key: KeyEvent, tx: &Sender<Msg>) {
-        // Global quit (but not during text input)
         if key.code == KeyCode::Char('q') && !self.is_text_input_active() {
             self.should_quit = true;
             return;
@@ -450,7 +462,6 @@ impl App {
         match &self.screen {
             Screen::Welcome(_) => self.handle_welcome_key(key, tx),
             Screen::Main(_) => {
-                // Popup gets priority
                 if let Screen::Main(main) = &self.screen {
                     if main.popup.is_some() {
                         self.handle_popup_key(key, tx);
@@ -481,12 +492,17 @@ impl App {
         };
 
         match &mut state.phase {
-            WelcomePhase::CheckingGithub | WelcomePhase::CheckingDo | WelcomePhase::TestingDo => {
+            // Loading states: only Esc to skip
+            WelcomePhase::CheckingGithub
+            | WelcomePhase::CheckingDo
+            | WelcomePhase::TestingDo
+            | WelcomePhase::GeneratingGithub => {
                 if key.code == KeyCode::Esc {
-                    self.transition_to_main(tx);
+                    self.transition_to_main();
                 }
             }
 
+            // Success states: auto-advance handles it, but Enter/Esc skip ahead
             WelcomePhase::GithubOk(_) | WelcomePhase::DoOk(_) => {
                 if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
                     state.auto_advance = 0;
@@ -500,27 +516,18 @@ impl App {
                     let tx = tx.clone();
                     std::thread::spawn(move || match ssh::generate_github_ssh_key() {
                         Ok((_, pub_key)) => {
-                            tx.send(Msg::GithubKeyGenerated { public_key: pub_key })
-                                .ok();
+                            tx.send(Msg::GithubKeyGenerated { public_key: pub_key }).ok();
                         }
                         Err(e) => {
                             tx.send(Msg::GithubKeyGenFailed(e.to_string())).ok();
                         }
                     });
                 }
-                KeyCode::Esc => self.transition_to_main(tx),
+                KeyCode::Esc => self.transition_to_main(),
                 _ => {}
             },
 
-            WelcomePhase::GeneratingGithub => {
-                if key.code == KeyCode::Esc {
-                    self.transition_to_main(tx);
-                }
-            }
-
-            WelcomePhase::GithubGenerated {
-                public_key, copied, ..
-            } => match key.code {
+            WelcomePhase::GithubGenerated { public_key, copied } => match key.code {
                 KeyCode::Char('c') | KeyCode::Char('C') => {
                     ssh::copy_to_clipboard(public_key);
                     *copied = true;
@@ -537,27 +544,21 @@ impl App {
                     std::thread::spawn(move || {
                         if let Some(path) = cfg.github_ssh_key_path {
                             let (ok, msg) = ssh::test_github_ssh_key(&path);
-                            tx.send(Msg::GithubTestResult {
-                                success: ok,
-                                message: msg,
-                            })
-                            .ok();
+                            tx.send(Msg::GithubTestResult { success: ok, message: msg }).ok();
                         }
                     });
                 }
-                KeyCode::Esc => self.transition_to_main(tx),
+                KeyCode::Esc => self.transition_to_main(),
                 _ => {}
             },
 
             WelcomePhase::TestingGithub { .. } => {
                 if key.code == KeyCode::Esc {
-                    self.transition_to_main(tx);
+                    self.transition_to_main();
                 }
             }
 
-            WelcomePhase::GithubFailed {
-                public_key, copied, ..
-            } => match key.code {
+            WelcomePhase::GithubFailed { public_key, copied, .. } => match key.code {
                 KeyCode::Char('c') | KeyCode::Char('C') => {
                     if let Some(pk) = public_key {
                         ssh::copy_to_clipboard(pk);
@@ -576,15 +577,11 @@ impl App {
                     std::thread::spawn(move || {
                         if let Some(path) = cfg.github_ssh_key_path {
                             let (ok, msg) = ssh::test_github_ssh_key(&path);
-                            tx.send(Msg::GithubTestResult {
-                                success: ok,
-                                message: msg,
-                            })
-                            .ok();
+                            tx.send(Msg::GithubTestResult { success: ok, message: msg }).ok();
                         }
                     });
                 }
-                KeyCode::Esc => self.transition_to_main(tx),
+                KeyCode::Esc => self.transition_to_main(),
                 _ => {}
             },
 
@@ -592,7 +589,7 @@ impl App {
                 KeyCode::Enter => {
                     state.phase = WelcomePhase::DoInput(TextInput::new("", true));
                 }
-                KeyCode::Esc => self.transition_to_main(tx),
+                KeyCode::Esc => self.transition_to_main(),
                 _ => {}
             },
 
@@ -609,16 +606,10 @@ impl App {
                     let tx = tx.clone();
                     std::thread::spawn(move || {
                         let (ok, msg) = ssh::test_do_api_key(&key_value);
-                        tx.send(Msg::DoTestResult {
-                            success: ok,
-                            message: msg,
-                        })
-                        .ok();
+                        tx.send(Msg::DoTestResult { success: ok, message: msg }).ok();
                     });
                 }
-                InputResult::Cancel => {
-                    self.transition_to_main(tx);
-                }
+                InputResult::Cancel => self.transition_to_main(),
                 InputResult::Continue => {}
             },
 
@@ -626,22 +617,16 @@ impl App {
                 KeyCode::Enter => {
                     state.phase = WelcomePhase::DoInput(TextInput::new("", true));
                 }
-                KeyCode::Esc => self.transition_to_main(tx),
+                KeyCode::Esc => self.transition_to_main(),
                 _ => {}
             },
-
-            WelcomePhase::AllReady => {
-                self.transition_to_main(tx);
-            }
         }
     }
 
     // ── Main Key Handling ───────────────────────────────────────────────────
 
     fn handle_main_key(&mut self, key: KeyEvent, tx: &Sender<Msg>) {
-        let Screen::Main(main) = &mut self.screen else {
-            return;
-        };
+        let Screen::Main(main) = &mut self.screen else { return };
 
         match key.code {
             KeyCode::Tab => {
@@ -658,22 +643,19 @@ impl App {
     }
 
     fn handle_droplets_key(&mut self, key: KeyEvent, tx: &Sender<Msg>) {
-        let Screen::Main(main) = &mut self.screen else {
-            return;
-        };
-
+        let Screen::Main(main) = &mut self.screen else { return };
         match main.droplets.focus {
             DFocus::List => self.handle_droplets_list_key(key, tx),
-            DFocus::Detail => self.handle_droplets_detail_key(key, tx),
+            DFocus::DetailInfo => self.handle_detail_info_key(key, tx),
+            DFocus::DetailProvision => self.handle_detail_provision_key(key, tx),
         }
     }
 
     fn handle_droplets_list_key(&mut self, key: KeyEvent, _tx: &Sender<Msg>) {
-        let Screen::Main(main) = &mut self.screen else {
-            return;
-        };
+        let Screen::Main(main) = &mut self.screen else { return };
         let ds = &mut main.droplets;
-        let total = ds.items.len() + ds.creating.len() + 1; // +1 for Create
+        let droplet_count = ds.registry.len();
+        let total = droplet_count + 1; // +1 for "+ Create new"
 
         match key.code {
             KeyCode::Up => {
@@ -687,45 +669,50 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Right => {
-                let items_len = ds.items.len();
-                let creating_len = ds.creating.len();
-
-                if ds.selected < items_len {
-                    // Selected an actual droplet
-                    let droplet = &ds.items[ds.selected];
-                    if !ds.deleting.contains(&droplet.id) {
-                        ds.focus = DFocus::Detail;
+                if ds.selected < droplet_count {
+                    let view = &ds.registry.views()[ds.selected];
+                    if view.local_status != LocalStatus::Deleting {
+                        ds.focus = DFocus::DetailInfo;
                         ds.detail_selected = 0;
                     }
-                } else if ds.selected >= items_len + creating_len {
-                    // "+ Create new"
-                    let count = items_len + creating_len;
+                } else {
+                    let count = droplet_count;
                     main.popup = Some(Popup::CreateDroplet(CreatePopupState {
                         step: CreateStep::Main { selected: 0 },
-                        region_idx: 2, // nyc1 (New York)
+                        region_idx: 2, // nyc1
                         machine_idx: 0,
                         name: format!("droplet-{}", count + 1),
                     }));
                 }
-                // Else it's a creating item, do nothing
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                if ds.selected < droplet_count {
+                    let view = &ds.registry.views()[ds.selected];
+                    if view.local_status != LocalStatus::Deleting {
+                        if let Some(api) = &view.api {
+                            let id = api.id;
+                            let name = api.name.clone();
+                            main.popup = Some(Popup::Confirm {
+                                message: format!("Delete '{name}'?"),
+                                action: PendingAction::DeleteDroplet { id, name },
+                            });
+                        }
+                    }
+                }
             }
             _ => {}
         }
     }
 
-    fn handle_droplets_detail_key(&mut self, key: KeyEvent, _tx: &Sender<Msg>) {
-        let Screen::Main(main) = &mut self.screen else {
-            return;
-        };
+    fn handle_detail_info_key(&mut self, key: KeyEvent, _tx: &Sender<Msg>) {
+        let Screen::Main(main) = &mut self.screen else { return };
         let ds = &mut main.droplets;
 
-        // How many actions? If droplet has IP: copy-ssh + delete = 2. Else: delete = 1.
-        let selected_idx = ds.selected;
-        let action_count = if selected_idx < ds.items.len() {
-            if ds.items[selected_idx].ip.is_some() {
-                2
+        let action_count = if let Some(view) = ds.registry.get_by_index(ds.selected) {
+            if let Some(api) = &view.api {
+                if api.ip.is_some() { 2 } else { 1 }
             } else {
-                1
+                0
             }
         } else {
             0
@@ -734,6 +721,12 @@ impl App {
         match key.code {
             KeyCode::Left | KeyCode::Esc => {
                 ds.focus = DFocus::List;
+            }
+            KeyCode::Right => {
+                ds.focus = DFocus::DetailProvision;
+                if let Some(view) = ds.registry.get_by_index(ds.selected) {
+                    ds.provision_selected = view.provision.most_recent_step();
+                }
             }
             KeyCode::Up => {
                 if ds.detail_selected > 0 {
@@ -746,16 +739,15 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if selected_idx >= ds.items.len() {
-                    return;
-                }
-                let droplet = ds.items[selected_idx].clone();
-                let has_ip = droplet.ip.is_some();
+                let Some(view) = ds.registry.get_by_index(ds.selected) else { return };
+                let Some(api) = &view.api else { return };
+                let has_ip = api.ip.is_some();
+                let droplet_id = api.id;
+                let droplet_name = api.name.clone();
+                let ip = api.ip.clone();
 
-                let action_idx = ds.detail_selected;
-                if has_ip && action_idx == 0 {
-                    // Copy SSH
-                    if let Some(ref ip) = droplet.ip {
+                if has_ip && ds.detail_selected == 0 {
+                    if let Some(ip) = ip {
                         let cfg = config::load();
                         let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
                         let cmd = format!(
@@ -763,23 +755,71 @@ impl App {
                         );
                         let copied = ssh::copy_to_clipboard(&cmd);
                         self.notification = Some((
-                            if copied {
-                                format!("Copied: {cmd}")
-                            } else {
-                                cmd
-                            },
+                            if copied { format!("Copied: {cmd}") } else { cmd },
                             30,
                         ));
                     }
                 } else {
-                    // Delete
                     main.popup = Some(Popup::Confirm {
-                        message: format!("Delete '{}'?", droplet.name),
+                        message: format!("Delete '{droplet_name}'?"),
                         action: PendingAction::DeleteDroplet {
-                            id: droplet.id,
-                            name: droplet.name,
+                            id: droplet_id,
+                            name: droplet_name,
                         },
                     });
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                let Some(view) = ds.registry.get_by_index(ds.selected) else { return };
+                if view.local_status != LocalStatus::Deleting {
+                    if let Some(api) = &view.api {
+                        let id = api.id;
+                        let name = api.name.clone();
+                        main.popup = Some(Popup::Confirm {
+                            message: format!("Delete '{name}'?"),
+                            action: PendingAction::DeleteDroplet { id, name },
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_detail_provision_key(&mut self, key: KeyEvent, _tx: &Sender<Msg>) {
+        let Screen::Main(main) = &mut self.screen else { return };
+        let ds = &mut main.droplets;
+        let step_count = PROVISION_STEP_NAMES.len();
+
+        match key.code {
+            KeyCode::Left | KeyCode::Esc => {
+                ds.focus = DFocus::DetailInfo;
+                // Reset to most recent step
+                if let Some(view) = ds.registry.get_by_index(ds.selected) {
+                    ds.provision_selected = view.provision.most_recent_step();
+                }
+            }
+            KeyCode::Up => {
+                if ds.provision_selected > 0 {
+                    ds.provision_selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if ds.provision_selected + 1 < step_count {
+                    ds.provision_selected += 1;
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                let Some(view) = ds.registry.get_by_index(ds.selected) else { return };
+                if view.local_status != LocalStatus::Deleting {
+                    if let Some(api) = &view.api {
+                        let id = api.id;
+                        let name = api.name.clone();
+                        main.popup = Some(Popup::Confirm {
+                            message: format!("Delete '{name}'?"),
+                            action: PendingAction::DeleteDroplet { id, name },
+                        });
+                    }
                 }
             }
             _ => {}
@@ -787,9 +827,7 @@ impl App {
     }
 
     fn handle_config_key(&mut self, key: KeyEvent, tx: &Sender<Msg>) {
-        let Screen::Main(main) = &mut self.screen else {
-            return;
-        };
+        let Screen::Main(main) = &mut self.screen else { return };
 
         match key.code {
             KeyCode::Left | KeyCode::Right => {
@@ -803,30 +841,24 @@ impl App {
                     CFocus::Github => &mut main.config.github,
                     CFocus::DigitalOcean => &mut main.config.digitalocean,
                 };
-                if info.selected > 0 {
-                    info.selected -= 1;
-                }
+                if info.selected > 0 { info.selected -= 1; }
             }
             KeyCode::Down => {
                 let info = match main.config.focus {
                     CFocus::Github => &mut main.config.github,
                     CFocus::DigitalOcean => &mut main.config.digitalocean,
                 };
-                if info.selected < 1 {
-                    info.selected += 1;
-                }
+                if info.selected < 1 { info.selected += 1; }
             }
             KeyCode::Enter => {
                 let focus = main.config.focus;
-                let info = match focus {
-                    CFocus::Github => &main.config.github,
-                    CFocus::DigitalOcean => &main.config.digitalocean,
+                let selected = match focus {
+                    CFocus::Github => main.config.github.selected,
+                    CFocus::DigitalOcean => main.config.digitalocean.selected,
                 };
-                let selected = info.selected;
 
                 match (focus, selected) {
                     (CFocus::Github, 0) => {
-                        // Set up again
                         let has_key = config::load().github_ssh_key_path.is_some();
                         if has_key {
                             main.popup = Some(Popup::Confirm {
@@ -834,33 +866,23 @@ impl App {
                                 action: PendingAction::RegenerateGithubKey,
                             });
                         } else {
-                            main.popup =
-                                Some(Popup::GithubSetup(GithubSetupPhase::Generating));
+                            main.popup = Some(Popup::GithubSetup(GithubSetupPhase::Generating));
                             let tx = tx.clone();
                             std::thread::spawn(move || match ssh::generate_github_ssh_key() {
-                                Ok((_, pk)) => {
-                                    tx.send(Msg::GithubKeyGenerated { public_key: pk }).ok();
-                                }
-                                Err(e) => {
-                                    tx.send(Msg::GithubKeyGenFailed(e.to_string())).ok();
-                                }
+                                Ok((_, pk)) => { tx.send(Msg::GithubKeyGenerated { public_key: pk }).ok(); }
+                                Err(e) => { tx.send(Msg::GithubKeyGenFailed(e.to_string())).ok(); }
                             });
                         }
                     }
                     (CFocus::Github, 1) => {
-                        // Test now
                         main.config.github.status = KeyStatus::Checking;
                         main.config.github.next_check = CHECK_INTERVAL_TICKS;
                         self.spawn_config_github_check(tx);
                     }
                     (CFocus::DigitalOcean, 0) => {
-                        // Set up again
-                        main.popup = Some(Popup::DoSetup(DoSetupPhase::Input(TextInput::new(
-                            "", true,
-                        ))));
+                        main.popup = Some(Popup::DoSetup(DoSetupPhase::Input(TextInput::new("", true))));
                     }
                     (CFocus::DigitalOcean, 1) => {
-                        // Test now
                         main.config.digitalocean.status = KeyStatus::Checking;
                         main.config.digitalocean.next_check = CHECK_INTERVAL_TICKS;
                         self.spawn_config_do_check(tx);
@@ -875,24 +897,15 @@ impl App {
     // ── Popup Key Handling ──────────────────────────────────────────────────
 
     fn handle_popup_key(&mut self, key: KeyEvent, tx: &Sender<Msg>) {
-        let Screen::Main(main) = &mut self.screen else {
-            return;
-        };
-
-        let popup = match &mut main.popup {
-            Some(p) => p,
-            None => return,
-        };
+        let Screen::Main(main) = &mut self.screen else { return };
+        let Some(popup) = &mut main.popup else { return };
 
         match popup {
             Popup::Confirm { action, .. } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     let action = std::mem::replace(
                         action,
-                        PendingAction::DeleteDroplet {
-                            id: 0,
-                            name: String::new(),
-                        },
+                        PendingAction::DeleteDroplet { id: 0, name: String::new() },
                     );
                     main.popup = None;
                     self.execute_pending_action(action, tx);
@@ -913,9 +926,7 @@ impl App {
 
             Popup::GithubSetup(phase) => match phase {
                 GithubSetupPhase::Generating => {
-                    if key.code == KeyCode::Esc {
-                        main.popup = None;
-                    }
+                    if key.code == KeyCode::Esc { main.popup = None; }
                 }
                 GithubSetupPhase::Ready { public_key, copied } => match key.code {
                     KeyCode::Char('c') | KeyCode::Char('C') => {
@@ -925,36 +936,23 @@ impl App {
                     KeyCode::Enter => {
                         let pk = public_key.clone();
                         let c = *copied;
-                        *phase = GithubSetupPhase::Testing {
-                            public_key: pk,
-                            copied: c,
-                        };
+                        *phase = GithubSetupPhase::Testing { public_key: pk, copied: c };
                         let tx = tx.clone();
                         let cfg = config::load();
                         std::thread::spawn(move || {
                             if let Some(path) = cfg.github_ssh_key_path {
                                 let (ok, msg) = ssh::test_github_ssh_key(&path);
-                                tx.send(Msg::GithubTestResult {
-                                    success: ok,
-                                    message: msg,
-                                })
-                                .ok();
+                                tx.send(Msg::GithubTestResult { success: ok, message: msg }).ok();
                             }
                         });
                     }
-                    KeyCode::Esc => {
-                        main.popup = None;
-                    }
+                    KeyCode::Esc => { main.popup = None; }
                     _ => {}
                 },
                 GithubSetupPhase::Testing { .. } => {
-                    if key.code == KeyCode::Esc {
-                        main.popup = None;
-                    }
+                    if key.code == KeyCode::Esc { main.popup = None; }
                 }
-                GithubSetupPhase::Failed {
-                    public_key, copied, ..
-                } => match key.code {
+                GithubSetupPhase::Failed { public_key, copied, .. } => match key.code {
                     KeyCode::Char('c') | KeyCode::Char('C') => {
                         ssh::copy_to_clipboard(public_key);
                         *copied = true;
@@ -962,32 +960,23 @@ impl App {
                     KeyCode::Enter => {
                         let pk = public_key.clone();
                         let c = *copied;
-                        *phase = GithubSetupPhase::Testing {
-                            public_key: pk,
-                            copied: c,
-                        };
+                        *phase = GithubSetupPhase::Testing { public_key: pk, copied: c };
                         let tx = tx.clone();
                         let cfg = config::load();
                         std::thread::spawn(move || {
                             if let Some(path) = cfg.github_ssh_key_path {
                                 let (ok, msg) = ssh::test_github_ssh_key(&path);
-                                tx.send(Msg::GithubTestResult {
-                                    success: ok,
-                                    message: msg,
-                                })
-                                .ok();
+                                tx.send(Msg::GithubTestResult { success: ok, message: msg }).ok();
                             }
                         });
                     }
-                    KeyCode::Esc => {
-                        main.popup = None;
-                    }
+                    KeyCode::Esc => { main.popup = None; }
                     _ => {}
                 },
                 GithubSetupPhase::Done(_) => {
                     if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
                         main.popup = None;
-                        main.config.github.next_check = 0; // trigger recheck
+                        main.config.github.next_check = 0;
                     }
                 }
             },
@@ -996,9 +985,7 @@ impl App {
                 DoSetupPhase::Input(input) => match input.handle_key(key) {
                     InputResult::Submit => {
                         let key_value = input.text.clone();
-                        if key_value.is_empty() {
-                            return;
-                        }
+                        if key_value.is_empty() { return; }
                         let mut cfg = config::load();
                         cfg.do_api_key = Some(key_value.clone());
                         config::save(&cfg);
@@ -1006,30 +993,20 @@ impl App {
                         let tx = tx.clone();
                         std::thread::spawn(move || {
                             let (ok, msg) = ssh::test_do_api_key(&key_value);
-                            tx.send(Msg::DoTestResult {
-                                success: ok,
-                                message: msg,
-                            })
-                            .ok();
+                            tx.send(Msg::DoTestResult { success: ok, message: msg }).ok();
                         });
                     }
-                    InputResult::Cancel => {
-                        main.popup = None;
-                    }
+                    InputResult::Cancel => { main.popup = None; }
                     InputResult::Continue => {}
                 },
                 DoSetupPhase::Testing => {
-                    if key.code == KeyCode::Esc {
-                        main.popup = None;
-                    }
+                    if key.code == KeyCode::Esc { main.popup = None; }
                 }
                 DoSetupPhase::Failed(_) => match key.code {
                     KeyCode::Enter => {
                         *phase = DoSetupPhase::Input(TextInput::new("", true));
                     }
-                    KeyCode::Esc => {
-                        main.popup = None;
-                    }
+                    KeyCode::Esc => { main.popup = None; }
                     _ => {}
                 },
                 DoSetupPhase::Done(_) => {
@@ -1043,36 +1020,16 @@ impl App {
     }
 
     fn handle_create_popup_key(&mut self, key: KeyEvent, tx: &Sender<Msg>) {
-        let Screen::Main(main) = &mut self.screen else {
-            return;
-        };
-        let Some(Popup::CreateDroplet(state)) = &mut main.popup else {
-            return;
-        };
+        let Screen::Main(main) = &mut self.screen else { return };
+        let Some(Popup::CreateDroplet(state)) = &mut main.popup else { return };
 
         match &mut state.step {
             CreateStep::Main { selected } => match key.code {
-                KeyCode::Up => {
-                    if *selected > 0 {
-                        *selected -= 1;
-                    }
-                }
-                KeyCode::Down => {
-                    if *selected < 4 {
-                        *selected += 1;
-                    }
-                }
+                KeyCode::Up => { if *selected > 0 { *selected -= 1; } }
+                KeyCode::Down => { if *selected < 4 { *selected += 1; } }
                 KeyCode::Enter => match *selected {
-                    0 => {
-                        state.step = CreateStep::Region {
-                            selected: state.region_idx,
-                        };
-                    }
-                    1 => {
-                        state.step = CreateStep::Machine {
-                            selected: state.machine_idx,
-                        };
-                    }
+                    0 => { state.step = CreateStep::Region { selected: state.region_idx }; }
+                    1 => { state.step = CreateStep::Machine { selected: state.machine_idx }; }
                     2 => {
                         let name = state.name.clone();
                         state.step = CreateStep::Name(TextInput::new(&name, false));
@@ -1083,7 +1040,7 @@ impl App {
                         let region = REGIONS[state.region_idx].slug.to_string();
                         let machine = MACHINES[state.machine_idx].slug.to_string();
                         main.popup = None;
-                        main.droplets.creating.push(name.clone());
+                        main.droplets.registry.add_creating(name.clone());
                         let tx = tx.clone();
                         std::thread::spawn(move || {
                             let cfg = config::load();
@@ -1092,96 +1049,54 @@ impl App {
                             let ssh_key_id = match ssh::ensure_droplet_ssh_key_on_do(&api_key) {
                                 Ok(id) => id,
                                 Err(e) => {
-                                    tx.send(Msg::DropletCreateFailed {
-                                        name,
-                                        error: e.to_string(),
-                                    })
-                                    .ok();
+                                    tx.send(Msg::DropletCreateFailed { name, error: e.to_string() }).ok();
                                     return;
                                 }
                             };
 
-                            match digitalocean::create_droplet(
-                                &api_key,
-                                &name,
-                                &region,
-                                &machine,
-                                &[ssh_key_id],
-                            ) {
+                            match digitalocean::create_droplet(&api_key, &name, &region, &machine, &[ssh_key_id]) {
                                 Ok(_) => {
-                                    tx.send(Msg::DropletCreateDone { name }).ok();
+                                    // Don't send a "done" message. The periodic refresh
+                                    // will pick up the new droplet from the API.
                                 }
                                 Err(e) => {
-                                    tx.send(Msg::DropletCreateFailed {
-                                        name,
-                                        error: e.to_string(),
-                                    })
-                                    .ok();
+                                    tx.send(Msg::DropletCreateFailed { name, error: e.to_string() }).ok();
                                 }
                             }
                         });
                     }
-                    4 => {
-                        // Cancel
-                        main.popup = None;
-                    }
+                    4 => { main.popup = None; }
                     _ => {}
                 },
-                KeyCode::Esc => {
-                    main.popup = None;
-                }
+                KeyCode::Esc => { main.popup = None; }
                 _ => {}
             },
 
             CreateStep::Region { selected } => match key.code {
-                KeyCode::Up => {
-                    if *selected > 0 {
-                        *selected -= 1;
-                    }
-                }
-                KeyCode::Down => {
-                    if *selected + 1 < REGIONS.len() {
-                        *selected += 1;
-                    }
-                }
+                KeyCode::Up => { if *selected > 0 { *selected -= 1; } }
+                KeyCode::Down => { if *selected + 1 < REGIONS.len() { *selected += 1; } }
                 KeyCode::Enter => {
                     state.region_idx = *selected;
                     state.step = CreateStep::Main { selected: 0 };
                 }
-                KeyCode::Esc => {
-                    state.step = CreateStep::Main { selected: 0 };
-                }
+                KeyCode::Esc => { state.step = CreateStep::Main { selected: 0 }; }
                 _ => {}
             },
 
             CreateStep::Machine { selected } => {
-                let available: Vec<usize> = MACHINES
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, m)| m.available)
-                    .map(|(i, _)| i)
-                    .collect();
-
+                let available_count = MACHINES.iter().filter(|m| m.available).count();
+                let available: Vec<usize> = MACHINES.iter().enumerate()
+                    .filter(|(_, m)| m.available).map(|(i, _)| i).collect();
                 match key.code {
-                    KeyCode::Up => {
-                        if *selected > 0 {
-                            *selected -= 1;
-                        }
-                    }
-                    KeyCode::Down => {
-                        if *selected + 1 < available.len() {
-                            *selected += 1;
-                        }
-                    }
+                    KeyCode::Up => { if *selected > 0 { *selected -= 1; } }
+                    KeyCode::Down => { if *selected + 1 < available_count { *selected += 1; } }
                     KeyCode::Enter => {
                         if *selected < available.len() {
                             state.machine_idx = available[*selected];
                         }
                         state.step = CreateStep::Main { selected: 1 };
                     }
-                    KeyCode::Esc => {
-                        state.step = CreateStep::Main { selected: 1 };
-                    }
+                    KeyCode::Esc => { state.step = CreateStep::Main { selected: 1 }; }
                     _ => {}
                 }
             }
@@ -1205,8 +1120,8 @@ impl App {
         match action {
             PendingAction::DeleteDroplet { id, name: _ } => {
                 if let Screen::Main(main) = &mut self.screen {
-                    main.droplets.deleting.insert(id);
-                    main.droplets.focus = DFocus::List;
+                    main.droplets.registry.mark_deleting(id);
+                    main.droplets.focus = DFocus::DetailInfo;
                 }
                 let tx = tx.clone();
                 let cfg = config::load();
@@ -1214,14 +1129,11 @@ impl App {
                 std::thread::spawn(move || {
                     match digitalocean::delete_droplet(&api_key, id) {
                         Ok(()) => {
-                            tx.send(Msg::DropletDeleted(id)).ok();
+                            // Don't send a "done" message. The periodic refresh
+                            // will notice the droplet is gone from the API.
                         }
                         Err(e) => {
-                            tx.send(Msg::DropletDeleteFailed {
-                                id,
-                                error: e.to_string(),
-                            })
-                            .ok();
+                            tx.send(Msg::DropletDeleteFailed { id, error: e.to_string() }).ok();
                         }
                     }
                 });
@@ -1232,12 +1144,8 @@ impl App {
                 }
                 let tx = tx.clone();
                 std::thread::spawn(move || match ssh::generate_github_ssh_key() {
-                    Ok((_, pk)) => {
-                        tx.send(Msg::GithubKeyGenerated { public_key: pk }).ok();
-                    }
-                    Err(e) => {
-                        tx.send(Msg::GithubKeyGenFailed(e.to_string())).ok();
-                    }
+                    Ok((_, pk)) => { tx.send(Msg::GithubKeyGenerated { public_key: pk }).ok(); }
+                    Err(e) => { tx.send(Msg::GithubKeyGenFailed(e.to_string())).ok(); }
                 });
             }
         }
@@ -1245,7 +1153,7 @@ impl App {
 
     // ── Handle Messages ─────────────────────────────────────────────────────
 
-    pub fn handle_message(&mut self, msg: Msg, _tx: &Sender<Msg>) {
+    pub fn handle_message(&mut self, msg: Msg, tx: &Sender<Msg>) {
         match msg {
             Msg::GithubKeyMissing => {
                 if let Screen::Welcome(state) = &mut self.screen {
@@ -1256,17 +1164,11 @@ impl App {
             Msg::GithubKeyGenerated { public_key } => {
                 match &mut self.screen {
                     Screen::Welcome(state) => {
-                        state.phase = WelcomePhase::GithubGenerated {
-                            public_key,
-                            copied: false,
-                        };
+                        state.phase = WelcomePhase::GithubGenerated { public_key, copied: false };
                     }
                     Screen::Main(main) => {
                         if let Some(Popup::GithubSetup(phase)) = &mut main.popup {
-                            *phase = GithubSetupPhase::Ready {
-                                public_key,
-                                copied: false,
-                            };
+                            *phase = GithubSetupPhase::Ready { public_key, copied: false };
                         }
                     }
                 }
@@ -1275,11 +1177,7 @@ impl App {
             Msg::GithubKeyGenFailed(error) => {
                 match &mut self.screen {
                     Screen::Welcome(state) => {
-                        state.phase = WelcomePhase::GithubFailed {
-                            error,
-                            public_key: None,
-                            copied: false,
-                        };
+                        state.phase = WelcomePhase::GithubFailed { error, public_key: None, copied: false };
                     }
                     Screen::Main(main) => {
                         main.popup = Some(Popup::Message(format!("Key generation failed: {error}")));
@@ -1300,11 +1198,7 @@ impl App {
                                 }
                                 _ => (None, false),
                             };
-                            state.phase = WelcomePhase::GithubFailed {
-                                error: message,
-                                public_key: pk,
-                                copied,
-                            };
+                            state.phase = WelcomePhase::GithubFailed { error: message, public_key: pk, copied };
                         }
                     }
                     Screen::Main(main) => {
@@ -1313,16 +1207,10 @@ impl App {
                                 *phase = GithubSetupPhase::Done(message);
                             } else {
                                 let (pk, c) = match phase {
-                                    GithubSetupPhase::Testing { public_key, copied } => {
-                                        (public_key.clone(), *copied)
-                                    }
+                                    GithubSetupPhase::Testing { public_key, copied } => (public_key.clone(), *copied),
                                     _ => (String::new(), false),
                                 };
-                                *phase = GithubSetupPhase::Failed {
-                                    error: message,
-                                    public_key: pk,
-                                    copied: c,
-                                };
+                                *phase = GithubSetupPhase::Failed { error: message, public_key: pk, copied: c };
                             }
                         }
                     }
@@ -1330,19 +1218,49 @@ impl App {
             }
 
             Msg::DoKeyExists => {
-                // Just waiting for the test result
+                // No action needed — DoTestResult will follow from the parallel thread
             }
 
             Msg::DoKeyMissing => {
                 if let Screen::Welcome(state) = &mut self.screen {
-                    state.phase = WelcomePhase::DoMissing;
+                    let in_github_phase = matches!(
+                        state.phase,
+                        WelcomePhase::CheckingGithub
+                            | WelcomePhase::GithubOk(_)
+                            | WelcomePhase::GithubMissing
+                            | WelcomePhase::GeneratingGithub
+                            | WelcomePhase::GithubGenerated { .. }
+                            | WelcomePhase::TestingGithub { .. }
+                            | WelcomePhase::GithubFailed { .. }
+                    );
+                    if in_github_phase {
+                        state.do_early_result = Some(DoEarlyResult::Missing);
+                    } else {
+                        state.phase = WelcomePhase::DoMissing;
+                    }
                 }
             }
 
             Msg::DoTestResult { success, message } => {
                 match &mut self.screen {
                     Screen::Welcome(state) => {
-                        if success {
+                        let in_github_phase = matches!(
+                            state.phase,
+                            WelcomePhase::CheckingGithub
+                                | WelcomePhase::GithubOk(_)
+                                | WelcomePhase::GithubMissing
+                                | WelcomePhase::GeneratingGithub
+                                | WelcomePhase::GithubGenerated { .. }
+                                | WelcomePhase::TestingGithub { .. }
+                                | WelcomePhase::GithubFailed { .. }
+                        );
+                        if in_github_phase {
+                            state.do_early_result = Some(if success {
+                                DoEarlyResult::TestOk(message)
+                            } else {
+                                DoEarlyResult::TestFailed(message)
+                            });
+                        } else if success {
                             state.phase = WelcomePhase::DoOk(message);
                             state.auto_advance = AUTO_ADVANCE_TICKS;
                         } else {
@@ -1362,69 +1280,258 @@ impl App {
             }
 
             Msg::DropletsLoaded(droplets) => {
+                let mut start_provision = Vec::new();
+                let mut needs_check = Vec::new();
+
                 if let Screen::Main(main) = &mut self.screen {
-                    main.droplets.items = droplets;
+                    // Check which droplets just became active (created in this session)
+                    let newly_active: Vec<String> = {
+                        let views = main.droplets.registry.views();
+                        droplets.iter().filter(|d| {
+                            d.status == "active"
+                                && views.iter().any(|v| {
+                                    v.name == d.name
+                                        && v.local_status == LocalStatus::Creating
+                                })
+                        }).map(|d| d.name.clone()).collect()
+                    };
+
+                    main.droplets.registry.merge_api_data(droplets);
                     main.droplets.loading = false;
+
                     // Clamp selection
-                    let total = main.droplets.items.len()
-                        + main.droplets.creating.len()
-                        + 1;
+                    let total = main.droplets.registry.len() + 1;
                     if main.droplets.selected >= total {
                         main.droplets.selected = total.saturating_sub(1);
                     }
-                }
-            }
 
-            Msg::DropletCreateDone { name } => {
-                if let Screen::Main(main) = &mut self.screen {
-                    main.droplets.creating.retain(|n| n != &name);
-                    main.droplets.refresh_countdown = 0; // trigger immediate refresh
+                    start_provision = newly_active;
+
+                    // Collect droplets that need remote state check (newly discovered active)
+                    needs_check = main.droplets.registry.views()
+                        .iter()
+                        .filter(|v| {
+                            v.provision.needs_check
+                                && v.api.as_ref().map_or(false, |a| a.ip.is_some())
+                        })
+                        .map(|v| {
+                            (
+                                v.name.clone(),
+                                v.api.as_ref().unwrap().ip.clone().unwrap(),
+                            )
+                        })
+                        .collect();
+
+                    // Clear needs_check to prevent re-triggering on next refresh
+                    for (name, _) in &needs_check {
+                        if let Some(view) = main.droplets.registry.find_by_name_mut(name) {
+                            view.provision.needs_check = false;
+                        }
+                    }
+                }
+
+                for name in start_provision {
+                    self.start_provisioning(&name, tx);
+                }
+                for (name, ip) in needs_check {
+                    self.spawn_provision_check(&name, &ip, tx);
                 }
             }
 
             Msg::DropletCreateFailed { name, error } => {
                 if let Screen::Main(main) = &mut self.screen {
-                    main.droplets.creating.retain(|n| n != &name);
-                    self.notification = Some((format!("Create failed: {error}"), 50));
+                    main.droplets.registry.mark_create_failed(&name);
                 }
-            }
-
-            Msg::DropletDeleted(id) => {
-                if let Screen::Main(main) = &mut self.screen {
-                    main.droplets.deleting.remove(&id);
-                    main.droplets.refresh_countdown = 0;
-                }
+                self.notification = Some((format!("Create failed: {error}"), 50));
             }
 
             Msg::DropletDeleteFailed { id, error } => {
+                // Unmark deleting — the refresh will show it back as normal
+                // (the delete API call failed, so it's still there)
                 if let Screen::Main(main) = &mut self.screen {
-                    main.droplets.deleting.remove(&id);
-                    self.notification = Some((format!("Delete failed: {error}"), 50));
+                    if let Some(view) = main.droplets.registry.views.iter_mut().find(|v| {
+                        v.api.as_ref().map_or(false, |a| a.id == id)
+                    }) {
+                        view.local_status = LocalStatus::Normal;
+                    }
+                }
+                self.notification = Some((format!("Delete failed: {error}"), 50));
+            }
+
+            Msg::ProvisionStepDone { name, step_idx } => {
+                if let Screen::Main(main) = &mut self.screen {
+                    if let Some(view) = main.droplets.registry.find_by_name_mut(&name) {
+                        if let Some(step) = view.provision.steps.get_mut(step_idx) {
+                            step.status = StepStatus::Done;
+                        }
+                        let next = step_idx + 1;
+                        if next < view.provision.steps.len() {
+                            view.provision.current = Some(next);
+                            view.provision.steps[next].status = StepStatus::Running;
+                            self.run_provision_step(&name, next, tx);
+                        } else {
+                            view.provision.current = None;
+                        }
+                    }
+                }
+            }
+
+            Msg::ProvisionStepFailed { name, step_idx, error } => {
+                if let Screen::Main(main) = &mut self.screen {
+                    if let Some(view) = main.droplets.registry.find_by_name_mut(&name) {
+                        if let Some(step) = view.provision.steps.get_mut(step_idx) {
+                            step.status = StepStatus::Failed(error.clone());
+                        }
+                        view.provision.error = Some(error);
+                        view.provision.current = None;
+                    }
+                }
+            }
+
+            Msg::ProvisionLog { name, step_idx, line } => {
+                if let Screen::Main(main) = &mut self.screen {
+                    if let Some(view) = main.droplets.registry.find_by_name_mut(&name) {
+                        if let Some(logs) = view.provision.step_logs.get_mut(step_idx) {
+                            logs.push(line);
+                            if logs.len() > 200 {
+                                logs.remove(0);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Msg::ProvisionStateChecked { name, completed_steps } => {
+                let mut start_step = None;
+                if let Screen::Main(main) = &mut self.screen {
+                    if let Some(view) = main.droplets.registry.find_by_name_mut(&name) {
+                        for (i, done) in completed_steps.iter().enumerate() {
+                            if *done {
+                                if let Some(step) = view.provision.steps.get_mut(i) {
+                                    step.status = StepStatus::Done;
+                                }
+                            }
+                        }
+                        let first_incomplete = completed_steps.iter().position(|&done| !done);
+                        match first_incomplete {
+                            Some(idx) => {
+                                view.provision.current = Some(idx);
+                                view.provision.steps[idx].status = StepStatus::Running;
+                                start_step = Some(idx);
+                            }
+                            None => {
+                                view.provision.current = None; // all done
+                            }
+                        }
+                    }
+                }
+                if let Some(idx) = start_step {
+                    self.run_provision_step(&name, idx, tx);
                 }
             }
 
             Msg::ConfigGithubCheck { success, message } => {
                 if let Screen::Main(main) = &mut self.screen {
-                    main.config.github.status = if success {
-                        KeyStatus::Ok
-                    } else {
-                        KeyStatus::Error
-                    };
+                    main.config.github.status = if success { KeyStatus::Ok } else { KeyStatus::Error };
                     main.config.github.message = Some(message);
                 }
             }
 
             Msg::ConfigDoCheck { success, message } => {
                 if let Screen::Main(main) = &mut self.screen {
-                    main.config.digitalocean.status = if success {
-                        KeyStatus::Ok
-                    } else {
-                        KeyStatus::Error
-                    };
+                    main.config.digitalocean.status = if success { KeyStatus::Ok } else { KeyStatus::Error };
                     main.config.digitalocean.message = Some(message);
                 }
             }
         }
+    }
+
+    // ── Provisioning ────────────────────────────────────────────────────────
+
+    fn start_provisioning(&self, name: &str, tx: &Sender<Msg>) {
+        self.run_provision_step(name, 0, tx);
+    }
+
+    fn run_provision_step(&self, name: &str, step_idx: usize, tx: &Sender<Msg>) {
+        let Screen::Main(main) = &self.screen else { return };
+        let Some(view) = main.droplets.registry.views().iter().find(|v| v.name == name) else { return };
+        let Some(api) = &view.api else { return };
+        let Some(ip) = &api.ip else { return };
+
+        let ip = ip.clone();
+        let name = name.to_string();
+        let tx = tx.clone();
+        let cfg = config::load();
+        let droplet_key = cfg.droplet_ssh_key_path.unwrap_or_default();
+
+        std::thread::spawn(move || {
+            let log_name = name.clone();
+            let log_tx = tx.clone();
+            let on_log = move |line: &str| {
+                log_tx
+                    .send(Msg::ProvisionLog {
+                        name: log_name.clone(),
+                        step_idx,
+                        line: line.to_string(),
+                    })
+                    .ok();
+            };
+
+            let result = match step_idx {
+                0 => ssh::provision_transport_github_key(&droplet_key, &ip, &on_log),
+                1 => ssh::provision_verify_github_key(&droplet_key, &ip, &on_log),
+                2 => ssh::provision_install_docker(&droplet_key, &ip, &on_log),
+                3 => ssh::provision_verify_docker(&droplet_key, &ip, &on_log),
+                4 => ssh::provision_install_flox(&droplet_key, &ip, &on_log),
+                5 => ssh::provision_verify_flox(&droplet_key, &ip, &on_log),
+                6 => ssh::provision_install_build_essential(&droplet_key, &ip, &on_log),
+                7 => ssh::provision_verify_build_essential(&droplet_key, &ip, &on_log),
+                8 => ssh::provision_clone_posthog(&droplet_key, &ip, &on_log),
+                9 => ssh::provision_verify_posthog_clone(&droplet_key, &ip, &on_log),
+                10 => ssh::provision_flox_activate(&droplet_key, &ip, &on_log),
+                _ => Ok(()),
+            };
+
+            match result {
+                Ok(()) => {
+                    tx.send(Msg::ProvisionStepDone { name, step_idx }).ok();
+                }
+                Err(e) => {
+                    tx.send(Msg::ProvisionStepFailed {
+                        name,
+                        step_idx,
+                        error: e.to_string(),
+                    })
+                    .ok();
+                }
+            }
+        });
+    }
+
+    fn spawn_provision_check(&self, name: &str, ip: &str, tx: &Sender<Msg>) {
+        let name = name.to_string();
+        let ip = ip.to_string();
+        let tx = tx.clone();
+        let cfg = config::load();
+        let droplet_key = cfg.droplet_ssh_key_path.unwrap_or_default();
+        let total = PROVISION_STEP_NAMES.len();
+
+        std::thread::spawn(move || {
+            match ssh::check_provision_markers(&droplet_key, &ip, total) {
+                Ok(markers) => {
+                    tx.send(Msg::ProvisionStateChecked {
+                        name,
+                        completed_steps: markers,
+                    })
+                    .ok();
+                }
+                Err(_) => {
+                    // SSH failed — could be droplet not ready. Will be retried
+                    // if needs_check gets set again (won't by default, so the
+                    // droplet stays in "pending" state).
+                }
+            }
+        });
     }
 
     // ── Background Task Spawning ────────────────────────────────────────────
@@ -1435,12 +1542,8 @@ impl App {
         std::thread::spawn(move || {
             if let Some(api_key) = cfg.do_api_key {
                 match digitalocean::list_droplets(&api_key) {
-                    Ok(droplets) => {
-                        tx.send(Msg::DropletsLoaded(droplets)).ok();
-                    }
-                    Err(_) => {
-                        tx.send(Msg::DropletsLoaded(vec![])).ok();
-                    }
+                    Ok(droplets) => { tx.send(Msg::DropletsLoaded(droplets)).ok(); }
+                    Err(_) => { tx.send(Msg::DropletsLoaded(vec![])).ok(); }
                 }
             } else {
                 tx.send(Msg::DropletsLoaded(vec![])).ok();
@@ -1453,16 +1556,10 @@ impl App {
         std::thread::spawn(move || {
             let cfg = config::load();
             let (ok, msg) = match cfg.github_ssh_key_path {
-                Some(path) if std::path::Path::new(&path).exists() => {
-                    ssh::test_github_ssh_key(&path)
-                }
+                Some(path) if std::path::Path::new(&path).exists() => ssh::test_github_ssh_key(&path),
                 _ => (false, "No key configured".to_string()),
             };
-            tx.send(Msg::ConfigGithubCheck {
-                success: ok,
-                message: msg,
-            })
-            .ok();
+            tx.send(Msg::ConfigGithubCheck { success: ok, message: msg }).ok();
         });
     }
 
@@ -1474,11 +1571,7 @@ impl App {
                 Some(key) if !key.is_empty() => ssh::test_do_api_key(&key),
                 _ => (false, "No key configured".to_string()),
             };
-            tx.send(Msg::ConfigDoCheck {
-                success: ok,
-                message: msg,
-            })
-            .ok();
+            tx.send(Msg::ConfigDoCheck { success: ok, message: msg }).ok();
         });
     }
 }

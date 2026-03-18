@@ -8,7 +8,7 @@ use crate::app::*;
 use crate::types::{MACHINES, REGIONS, SPINNER};
 
 /// Renders the create droplet flow as a full-screen view (not an overlay).
-pub fn draw_create_fullscreen(f: &mut Frame, state: &CreatePopupState, spin: usize) {
+pub fn draw_create_fullscreen(f: &mut Frame, state: &CreatePopupState, _spin: usize) {
     let area = f.area();
     f.render_widget(Clear, area);
 
