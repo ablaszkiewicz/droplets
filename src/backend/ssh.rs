@@ -162,6 +162,54 @@ pub fn copy_to_clipboard(text: &str) -> bool {
     }
 }
 
+pub fn open_ssh_in_terminal(key_path: &str, ip: &str) -> bool {
+    let ssh_cmd = format!(
+        "ssh -i {key_path} -o StrictHostKeyChecking=accept-new root@{ip}"
+    );
+    let script = format!(
+        "tell application \"Terminal\"\n\
+         \tactivate\n\
+         \tdo script \"{ssh_cmd}\"\n\
+         end tell"
+    );
+    Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| true)
+        .unwrap_or(false)
+}
+
+pub fn start_port_forward(
+    key_path: &str,
+    ip: &str,
+    local_port: u16,
+) -> Result<std::process::Child> {
+    let child = Command::new("ssh")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .arg("-i")
+        .arg(key_path)
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ServerAliveInterval=30")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3")
+        .arg("-N")
+        .arg("-L")
+        .arg(format!("{local_port}:localhost:8010"))
+        .arg(format!("root@{ip}"))
+        .spawn()?;
+    Ok(child)
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Strip ANSI escape sequences and control characters from a line.

@@ -321,6 +321,55 @@ fn draw_detail_info_window(
                 Span::styled("Copy SSH cmd", style),
             ]));
             action_idx += 1;
+
+            let open_style = if focused && ds.detail_selected == action_idx {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("Open SSH in terminal", open_style),
+            ]));
+            action_idx += 1;
+
+            // Port forward toggle
+            let pf = &view.port_forward;
+            let fwd_label = if pf.active {
+                format!("Stop fwd :{} -> :8010", pf.local_port)
+            } else {
+                format!("Forward :{} -> :8010", pf.local_port)
+            };
+            let fwd_color = if pf.active { Color::Green } else { Color::White };
+            let fwd_style = if focused && ds.detail_selected == action_idx {
+                Style::default()
+                    .fg(fwd_color)
+                    .add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(fwd_color)
+            };
+            let fwd_icon = if pf.active { "● " } else { "  " };
+            lines.push(Line::from(vec![
+                Span::styled(fwd_icon, Style::default().fg(Color::Green)),
+                Span::styled(fwd_label, fwd_style),
+            ]));
+            action_idx += 1;
+
+            // Set local port
+            let port_style = if focused && ds.detail_selected == action_idx {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("Set local port...", port_style),
+            ]));
+            action_idx += 1;
         }
 
         let del_style = if focused && ds.detail_selected == action_idx {
@@ -641,12 +690,22 @@ fn draw_footer(
                 ("←/Esc", "back"),
                 ("q", "quit"),
             ],
-            DFocus::DetailProvision => vec![
-                ("↑↓", "select step"),
-                ("←", "back"),
-                ("D", "delete"),
-                ("q", "quit"),
-            ],
+            DFocus::DetailProvision => {
+                let mut b = vec![("↑↓", "select step")];
+                // Show restart hint if selected step has failed
+                let has_failure = state
+                    .droplets
+                    .registry
+                    .get_by_index(state.droplets.selected)
+                    .and_then(|v| v.provision.steps.get(state.droplets.provision_selected))
+                    .map(|s| matches!(s.status, StepStatus::Failed(_)))
+                    .unwrap_or(false);
+                if has_failure {
+                    b.push(("R", "restart"));
+                }
+                b.extend_from_slice(&[("←", "back"), ("D", "delete"), ("q", "quit")]);
+                b
+            }
         },
         Tab::Config => vec![
             ("←→", "switch"),

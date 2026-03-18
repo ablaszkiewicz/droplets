@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -114,6 +115,7 @@ pub struct DropletsState {
     pub provision_selected: usize,
     pub refresh_countdown: u32,
     pub loading: bool,
+    pub tunnels: HashMap<String, std::process::Child>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -157,6 +159,7 @@ pub enum Popup {
     Confirm { message: String, action: PendingAction },
     GithubSetup(GithubSetupPhase),
     DoSetup(DoSetupPhase),
+    PortInput { droplet_name: String, input: TextInput },
     Message(String),
 }
 
@@ -365,6 +368,20 @@ impl App {
                     main.config.digitalocean.status = KeyStatus::Checking;
                     do_check_do = true;
                 }
+
+                // Check tunnel health: detect dead SSH tunnel processes
+                let mut dead_tunnels = Vec::new();
+                for (name, child) in main.droplets.tunnels.iter_mut() {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        dead_tunnels.push(name.clone());
+                    }
+                }
+                for name in &dead_tunnels {
+                    main.droplets.tunnels.remove(name);
+                    if let Some(view) = main.droplets.registry.find_by_name_mut(name) {
+                        view.port_forward.active = false;
+                    }
+                }
             }
         }
 
@@ -431,6 +448,7 @@ impl App {
                 provision_selected: 0,
                 refresh_countdown: 0,
                 loading: true,
+                tunnels: HashMap::new(),
             },
             config: ConfigViewState {
                 focus: CFocus::Github,
@@ -479,6 +497,7 @@ impl App {
             Screen::Main(m) => match &m.popup {
                 Some(Popup::CreateDroplet(c)) => matches!(c.step, CreateStep::Name(_)),
                 Some(Popup::DoSetup(DoSetupPhase::Input(_))) => true,
+                Some(Popup::PortInput { .. }) => true,
                 _ => false,
             },
         }
@@ -710,7 +729,7 @@ impl App {
 
         let action_count = if let Some(view) = ds.registry.get_by_index(ds.selected) {
             if let Some(api) = &view.api {
-                if api.ip.is_some() { 2 } else { 1 }
+                if api.ip.is_some() { 5 } else { 1 } // Copy SSH, Open SSH, Forward, Set port, Delete  vs  Delete
             } else {
                 0
             }
@@ -747,6 +766,7 @@ impl App {
                 let ip = api.ip.clone();
 
                 if has_ip && ds.detail_selected == 0 {
+                    // Copy SSH cmd
                     if let Some(ip) = ip {
                         let cfg = config::load();
                         let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
@@ -759,7 +779,73 @@ impl App {
                             30,
                         ));
                     }
+                } else if has_ip && ds.detail_selected == 1 {
+                    // Open SSH in terminal
+                    if let Some(ip) = ip {
+                        let cfg = config::load();
+                        let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
+                        if ssh::open_ssh_in_terminal(&key_path, &ip) {
+                            self.notification = Some(("Opened SSH in Terminal.app".to_string(), 30));
+                        } else {
+                            self.notification = Some(("Failed to open terminal".to_string(), 30));
+                        }
+                    }
+                } else if has_ip && ds.detail_selected == 2 {
+                    // Toggle port forwarding
+                    let droplet_name = droplet_name.clone();
+                    let local_port = ds.registry.get_by_index(ds.selected)
+                        .map(|v| v.port_forward.local_port)
+                        .unwrap_or(28000);
+                    let is_active = ds.registry.get_by_index(ds.selected)
+                        .map(|v| v.port_forward.active)
+                        .unwrap_or(false);
+
+                    if is_active {
+                        // Stop forwarding
+                        if let Some(mut child) = ds.tunnels.remove(&droplet_name) {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        if let Some(view) = ds.registry.get_by_index_mut(ds.selected) {
+                            view.port_forward.active = false;
+                        }
+                        self.notification = Some(("Port forwarding stopped".to_string(), 30));
+                    } else {
+                        // Start forwarding
+                        if let Some(ref ip) = ip {
+                            let cfg = config::load();
+                            let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
+                            match ssh::start_port_forward(&key_path, ip, local_port) {
+                                Ok(child) => {
+                                    ds.tunnels.insert(droplet_name, child);
+                                    if let Some(view) = ds.registry.get_by_index_mut(ds.selected) {
+                                        view.port_forward.active = true;
+                                    }
+                                    self.notification = Some((
+                                        format!("Forwarding localhost:{local_port} -> remote:8010"),
+                                        30,
+                                    ));
+                                }
+                                Err(e) => {
+                                    self.notification = Some((
+                                        format!("Port forward failed: {e}"),
+                                        50,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                } else if has_ip && ds.detail_selected == 3 {
+                    // Set local port
+                    let current_port = ds.registry.get_by_index(ds.selected)
+                        .map(|v| v.port_forward.local_port)
+                        .unwrap_or(28000);
+                    main.popup = Some(Popup::PortInput {
+                        droplet_name: droplet_name.clone(),
+                        input: TextInput::new(&current_port.to_string(), false),
+                    });
                 } else {
+                    // Delete
                     main.popup = Some(Popup::Confirm {
                         message: format!("Delete '{droplet_name}'?"),
                         action: PendingAction::DeleteDroplet {
@@ -786,7 +872,7 @@ impl App {
         }
     }
 
-    fn handle_detail_provision_key(&mut self, key: KeyEvent, _tx: &Sender<Msg>) {
+    fn handle_detail_provision_key(&mut self, key: KeyEvent, tx: &Sender<Msg>) {
         let Screen::Main(main) = &mut self.screen else { return };
         let ds = &mut main.droplets;
         let step_count = PROVISION_STEP_NAMES.len();
@@ -807,6 +893,27 @@ impl App {
             KeyCode::Down => {
                 if ds.provision_selected + 1 < step_count {
                     ds.provision_selected += 1;
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                let selected_step = ds.provision_selected;
+                let selected_droplet = ds.selected;
+                let Some(view) = ds.registry.get_by_index_mut(selected_droplet) else { return };
+                let has_failure = matches!(
+                    view.provision.steps.get(selected_step).map(|s| &s.status),
+                    Some(StepStatus::Failed(_))
+                );
+                if has_failure {
+                    // Clear error state
+                    view.provision.error = None;
+                    view.provision.steps[selected_step].status = StepStatus::Running;
+                    view.provision.current = Some(selected_step);
+                    // Clear logs for this step so fresh output shows
+                    if let Some(logs) = view.provision.step_logs.get_mut(selected_step) {
+                        logs.clear();
+                    }
+                    let name = view.name.clone();
+                    self.run_provision_step(&name, selected_step, tx);
                 }
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
@@ -921,6 +1028,49 @@ impl App {
                     main.popup = None;
                 }
             }
+
+            Popup::PortInput { droplet_name, input } => match input.handle_key(key) {
+                InputResult::Submit => {
+                    if let Ok(port) = input.text.parse::<u16>() {
+                        if port >= 1024 {
+                            let name = droplet_name.clone();
+                            // If tunnel is active, restart with new port
+                            let was_active = if let Some(mut child) = main.droplets.tunnels.remove(&name) {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                true
+                            } else {
+                                false
+                            };
+                            if let Some(view) = main.droplets.registry.find_by_name_mut(&name) {
+                                view.port_forward.local_port = port;
+                                if was_active {
+                                    view.port_forward.active = false;
+                                    // Restart with new port
+                                    if let Some(api) = &view.api {
+                                        if let Some(ref ip) = api.ip {
+                                            let cfg = config::load();
+                                            let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
+                                            if let Ok(child) = ssh::start_port_forward(&key_path, ip, port) {
+                                                main.droplets.tunnels.insert(name.clone(), child);
+                                                view.port_forward.active = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            main.popup = None;
+                            self.notification = Some((format!("Local port set to {port}"), 30));
+                        } else {
+                            self.notification = Some(("Port must be >= 1024".to_string(), 30));
+                        }
+                    } else {
+                        self.notification = Some(("Invalid port number".to_string(), 30));
+                    }
+                }
+                InputResult::Cancel => { main.popup = None; }
+                InputResult::Continue => {}
+            },
 
             Popup::CreateDroplet(_) => self.handle_create_popup_key(key, tx),
 
@@ -1118,8 +1268,13 @@ impl App {
 
     fn execute_pending_action(&mut self, action: PendingAction, tx: &Sender<Msg>) {
         match action {
-            PendingAction::DeleteDroplet { id, name: _ } => {
+            PendingAction::DeleteDroplet { id, ref name } => {
                 if let Screen::Main(main) = &mut self.screen {
+                    // Kill tunnel if active
+                    if let Some(mut child) = main.droplets.tunnels.remove(name) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
                     main.droplets.registry.mark_deleting(id);
                     main.droplets.focus = DFocus::DetailInfo;
                 }
@@ -1573,5 +1728,14 @@ impl App {
             };
             tx.send(Msg::ConfigDoCheck { success: ok, message: msg }).ok();
         });
+    }
+
+    pub fn cleanup(&mut self) {
+        if let Screen::Main(main) = &mut self.screen {
+            for (_, mut child) in main.droplets.tunnels.drain() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 }

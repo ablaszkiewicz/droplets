@@ -21,6 +21,22 @@ pub struct DropletView {
     pub name: String,
     pub local_status: LocalStatus,
     pub provision: ProvisionState,
+    pub port_forward: PortForwardInfo,
+}
+
+#[derive(Debug, Clone)]
+pub struct PortForwardInfo {
+    pub local_port: u16,
+    pub active: bool,
+}
+
+impl PortForwardInfo {
+    pub fn new() -> Self {
+        Self {
+            local_port: 28000,
+            active: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,6 +211,7 @@ impl DropletRegistry {
                     api: Some(api),
                     local_status: LocalStatus::Normal,
                     provision: ps,
+                    port_forward: PortForwardInfo::new(),
                 });
             }
         }
@@ -206,6 +223,7 @@ impl DropletRegistry {
             api: None,
             local_status: LocalStatus::Creating,
             provision: ProvisionState::new(),
+            port_forward: PortForwardInfo::new(),
         });
     }
 
@@ -267,15 +285,15 @@ pub const REGIONS: &[Region] = &[
 
 pub const MACHINES: &[MachineSize] = &[
     MachineSize {
-        slug: "gd-8vcpu-32gb-intel",
-        name: "General Purpose Intel",
-        desc: "8 vCPU / 32GB",
+        slug: "c-16-intel",
+        name: "CPU-Optimized 16 Intel",
+        desc: "16 vCPU / 32GB",
         available: true,
     },
     MachineSize {
-        slug: "s-2vcpu-8gb-160gb-intel",
-        name: "Premium Intel Medium",
-        desc: "2 vCPU / 8GB / 160GB",
+        slug: "c-32-intel",
+        name: "CPU-Optimized 32 Intel",
+        desc: "32 vCPU / 64GB",
         available: true,
     },
 ];

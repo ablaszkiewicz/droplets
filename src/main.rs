@@ -77,5 +77,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Result<
         }
     }
 
+    app.cleanup();
     Ok(())
 }
