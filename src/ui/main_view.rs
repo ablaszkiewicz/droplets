@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::*;
-use crate::types::{time_ago, LocalStatus, StepStatus, SPINNER};
+use crate::types::{time_ago, seconds_since, hourly_price_for_size, snapshot_monthly_cost, LocalStatus, StepStatus, SPINNER};
 
 pub fn draw(
     f: &mut Frame,
@@ -291,6 +291,21 @@ fn draw_detail_info_window(
                 Span::styled(" Age: ", Style::default().fg(Color::DarkGray)),
                 Span::raw(ago),
             ]));
+        }
+
+        if let Some(rate) = hourly_price_for_size(&api.size) {
+            lines.push(Line::from(vec![
+                Span::styled(" Rate:", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!(" ${:.3}/hr", rate), Style::default().fg(Color::Yellow)),
+            ]));
+            if let Some(secs) = seconds_since(&api.created_at) {
+                let hours = secs as f64 / 3600.0;
+                let cost = hours * rate;
+                lines.push(Line::from(vec![
+                    Span::styled(" Cost:", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!(" ~${:.2}", cost), Style::default().fg(Color::Yellow)),
+                ]));
+            }
         }
     } else {
         lines.push(Line::from(vec![Span::styled(
@@ -616,11 +631,12 @@ fn draw_snapshots_list(f: &mut Frame, area: Rect, ss: &SnapshotsState, spin: usi
             Style::default().fg(Color::White)
         };
 
-        let size_text = format!(" ({:.1} GB)", snap.size_gigabytes);
+        let monthly = snapshot_monthly_cost(snap.size_gigabytes);
+        let cost_text = format!(" ({:.1} GB, ~${:.2}/mo)", snap.size_gigabytes, monthly);
         lines.push(Line::from(vec![
             Span::styled(" ● ", Style::default().fg(Color::Cyan)),
             Span::styled(&snap.name, name_style),
-            Span::styled(size_text, Style::default().fg(Color::DarkGray)),
+            Span::styled(cost_text, Style::default().fg(Color::DarkGray)),
         ]));
     }
 
@@ -663,6 +679,7 @@ fn draw_snapshot_detail(f: &mut Frame, area: Rect, ss: &SnapshotsState) {
     } else {
         snap.regions.join(", ")
     };
+    let monthly = snapshot_monthly_cost(snap.size_gigabytes);
 
     let lines = vec![
         Line::from(vec![
@@ -680,6 +697,10 @@ fn draw_snapshot_detail(f: &mut Frame, area: Rect, ss: &SnapshotsState) {
         Line::from(vec![
             Span::styled(" Size:    ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{:.2} GB", snap.size_gigabytes)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Cost:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("~${:.2}/mo", monthly), Style::default().fg(Color::Yellow)),
         ]),
         Line::from(vec![
             Span::styled(" Regions: ", Style::default().fg(Color::DarkGray)),

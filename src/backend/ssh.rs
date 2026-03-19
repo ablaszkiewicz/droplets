@@ -587,11 +587,11 @@ pub fn provision_pull_latest_main(
         droplet_key,
         ip,
         "cd /root/posthog && BRANCH=$(git rev-parse --abbrev-ref HEAD) && \
-         if [ \"$BRANCH\" = \"main\" ] || [ \"$BRANCH\" = \"master\" ]; then \
+         if [ \"$BRANCH\" = \"master\" ] || [ \"$BRANCH\" = \"main\" ]; then \
            echo \"On branch $BRANCH, pulling latest...\" && \
-           git fetch origin main && git reset --hard origin/main; \
+           git fetch origin master && git reset --hard origin/master; \
          else \
-           echo \"On branch $BRANCH, skipping pull (not on main)\"; \
+           echo \"On branch $BRANCH, skipping pull (not on master)\"; \
          fi",
         on_log,
     )?;

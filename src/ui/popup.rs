@@ -188,7 +188,7 @@ fn draw_create_machine_content(f: &mut Frame, area: Rect, selected: usize) {
         let prefix = if is_sel { "  > " } else { "    " };
         lines.push(Line::from(vec![
             Span::raw(prefix),
-            Span::styled(format!("{}  {}", m.name, m.desc), style),
+            Span::styled(format!("{}  {}  ${:.3}/hr", m.name, m.desc, m.hourly_price), style),
         ]));
     }
     f.render_widget(Paragraph::new(lines), area);
@@ -495,7 +495,7 @@ fn draw_create_machine(f: &mut Frame, selected: usize) {
         let prefix = if is_sel { "  > " } else { "    " };
         lines.push(Line::from(vec![
             Span::raw(prefix),
-            Span::styled(format!("{}  {}", m.name, m.desc), style),
+            Span::styled(format!("{}  {}  ${:.3}/hr", m.name, m.desc, m.hourly_price), style),
         ]));
     }
     lines.push(Line::raw(""));
@@ -651,7 +651,7 @@ fn draw_github_setup(f: &mut Frame, phase: &GithubSetupPhase, spin: usize) {
 // ── DO Setup ────────────────────────────────────────────────────────────────
 
 fn draw_do_setup(f: &mut Frame, phase: &DoSetupPhase, spin: usize) {
-    let rect = centered(f.area(), 55, 10);
+    let rect = centered(f.area(), 65, 16);
     f.render_widget(Clear, rect);
 
     let block = Block::default()
@@ -667,6 +667,23 @@ fn draw_do_setup(f: &mut Frame, phase: &DoSetupPhase, spin: usize) {
     match phase {
         DoSetupPhase::Input(input) => {
             lines.push(Line::raw("  Enter your DigitalOcean API token:"));
+            lines.push(Line::styled(
+                "  https://cloud.digitalocean.com/account/api/tokens",
+                Style::default().fg(Color::Cyan),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  Required scopes:",
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::styled(
+                "  account:read  droplet:create/read/delete",
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::styled(
+                "  image:create  snapshot:read/delete  ssh_key:create/read",
+                Style::default().fg(Color::DarkGray),
+            ));
             lines.push(Line::raw(""));
 
             let display: String = input.display();
@@ -676,7 +693,7 @@ fn draw_do_setup(f: &mut Frame, phase: &DoSetupPhase, spin: usize) {
             ]));
 
             let cursor_x = inner.x + 4 + input.cursor as u16;
-            let cursor_y = inner.y + 3;
+            let cursor_y = inner.y + 8;
             if cursor_x < inner.x + inner.width {
                 f.set_cursor_position((cursor_x, cursor_y));
             }

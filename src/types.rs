@@ -284,6 +284,7 @@ pub struct MachineSize {
     pub name: &'static str,
     pub desc: &'static str,
     pub available: bool,
+    pub hourly_price: f64,
 }
 
 pub const REGIONS: &[Region] = &[
@@ -301,65 +302,77 @@ pub const MACHINES: &[MachineSize] = &[
         name: "CPU-Optimized 16 Intel",
         desc: "16 vCPU / 32GB",
         available: true,
+        hourly_price: 0.650,
     },
     MachineSize {
         slug: "c-32-intel",
         name: "CPU-Optimized 32 Intel",
         desc: "32 vCPU / 64GB",
         available: true,
+        hourly_price: 1.300,
     },
 ];
 
 pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-pub fn time_ago(iso_str: &str) -> String {
+/// Returns the number of seconds since an ISO 8601 timestamp, or None on parse failure.
+pub fn seconds_since(iso_str: &str) -> Option<i64> {
     if iso_str.is_empty() {
-        return String::new();
+        return None;
     }
     let iso = iso_str.replace('Z', "+00:00");
     let parts: Vec<&str> = iso.split('T').collect();
     if parts.len() != 2 {
-        return String::new();
+        return None;
     }
     let date_parts: Vec<&str> = parts[0].split('-').collect();
     let time_part = parts[1].split('+').next().unwrap_or("");
     let time_parts: Vec<&str> = time_part.split(':').collect();
 
     if date_parts.len() != 3 || time_parts.len() < 3 {
-        return String::new();
+        return None;
     }
 
-    let parse = || -> Option<i64> {
-        use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-        let y: i64 = date_parts[0].parse().ok()?;
-        let mo: i64 = date_parts[1].parse().ok()?;
-        let d: i64 = date_parts[2].parse().ok()?;
-        let h: i64 = time_parts[0].parse().ok()?;
-        let mi: i64 = time_parts[1].parse().ok()?;
-        let s: i64 = time_parts[2].split('.').next()?.parse().ok()?;
+    let y: i64 = date_parts[0].parse().ok()?;
+    let mo: i64 = date_parts[1].parse().ok()?;
+    let d: i64 = date_parts[2].parse().ok()?;
+    let h: i64 = time_parts[0].parse().ok()?;
+    let mi: i64 = time_parts[1].parse().ok()?;
+    let s: i64 = time_parts[2].split('.').next()?.parse().ok()?;
 
-        let days = (y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400;
-        let month_days: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        let mut day_sum = days;
-        for i in 0..(mo - 1) as usize {
-            day_sum += month_days.get(i).copied().unwrap_or(30);
-        }
-        if mo > 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) {
-            day_sum += 1;
-        }
-        day_sum += d - 1;
-        let created_epoch = day_sum * 86400 + h * 3600 + mi * 60 + s;
+    let days = (y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400;
+    let month_days: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut day_sum = days;
+    for i in 0..(mo - 1) as usize {
+        day_sum += month_days.get(i).copied().unwrap_or(30);
+    }
+    if mo > 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) {
+        day_sum += 1;
+    }
+    day_sum += d - 1;
+    let created_epoch = day_sum * 86400 + h * 3600 + mi * 60 + s;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_secs() as i64;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
 
-        Some(now - created_epoch)
-    };
+    Some(now - created_epoch)
+}
 
-    match parse() {
+pub fn hourly_price_for_size(size_slug: &str) -> Option<f64> {
+    MACHINES.iter().find(|m| m.slug == size_slug).map(|m| m.hourly_price)
+}
+
+/// Snapshot storage cost: $0.06/GB per month
+pub fn snapshot_monthly_cost(size_gb: f64) -> f64 {
+    size_gb * 0.06
+}
+
+pub fn time_ago(iso_str: &str) -> String {
+    match seconds_since(iso_str) {
         Some(secs) if secs < 60 => "just now".to_string(),
         Some(secs) if secs < 3600 => format!("{}m ago", secs / 60),
         Some(secs) if secs < 86400 => format!("{}h ago", secs / 3600),
