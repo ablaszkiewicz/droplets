@@ -575,7 +575,31 @@ pub fn provision_verify_posthog_clone(
     Ok(())
 }
 
-/// Step 10: Activate Flox environment in PostHog dir.
+/// Step 10: Pull latest main (only if current branch is master/main).
+/// No marker — always re-runs on rediscovery so snapshot-based droplets get updates.
+/// Skips if the user has switched to a different branch (work in progress).
+pub fn provision_pull_latest_main(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    ssh_run_logged(
+        droplet_key,
+        ip,
+        "cd /root/posthog && BRANCH=$(git rev-parse --abbrev-ref HEAD) && \
+         if [ \"$BRANCH\" = \"main\" ] || [ \"$BRANCH\" = \"master\" ]; then \
+           echo \"On branch $BRANCH, pulling latest...\" && \
+           git fetch origin main && git reset --hard origin/main; \
+         else \
+           echo \"On branch $BRANCH, skipping pull (not on main)\"; \
+         fi",
+        on_log,
+    )?;
+    // Intentionally no marker — this step always re-runs
+    Ok(())
+}
+
+/// Step 11: Activate Flox environment in PostHog dir.
 pub fn provision_flox_activate(
     droplet_key: &str,
     ip: &str,
@@ -587,6 +611,6 @@ pub fn provision_flox_activate(
         "cd /root/posthog && flox activate -- echo 'Flox environment ready'",
         on_log,
     )?;
-    write_provision_marker(droplet_key, ip, 10)?;
+    write_provision_marker(droplet_key, ip, 11)?;
     Ok(())
 }

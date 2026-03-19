@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::*;
-use crate::types::{MACHINES, REGIONS, SPINNER};
+use crate::types::{MACHINES, REGIONS, SPINNER, SnapshotInfo};
 
 /// Renders the create droplet flow as a full-screen view (not an overlay).
 pub fn draw_create_fullscreen(f: &mut Frame, state: &CreatePopupState, _spin: usize) {
@@ -24,6 +24,7 @@ pub fn draw_create_fullscreen(f: &mut Frame, state: &CreatePopupState, _spin: us
             CreateStep::Main { .. } => " Create Droplet ",
             CreateStep::Region { .. } => " Select Region ",
             CreateStep::Machine { .. } => " Select Machine ",
+            CreateStep::Snapshot { .. } => " Select Image ",
             CreateStep::Name(_) => " Droplet Name ",
         })
         .border_style(Style::default().fg(Color::Green));
@@ -41,6 +42,9 @@ pub fn draw_create_fullscreen(f: &mut Frame, state: &CreatePopupState, _spin: us
         CreateStep::Machine { selected } => {
             draw_create_machine_content(f, inner, *selected);
         }
+        CreateStep::Snapshot { selected } => {
+            draw_create_snapshot_content(f, inner, &state.snapshots, *selected);
+        }
         CreateStep::Name(input) => {
             draw_create_name_content(f, inner, input);
         }
@@ -49,7 +53,7 @@ pub fn draw_create_fullscreen(f: &mut Frame, state: &CreatePopupState, _spin: us
     // Footer
     let footer_text = match &state.step {
         CreateStep::Main { .. } => " ↑↓ navigate │ Enter select │ Esc cancel",
-        CreateStep::Region { .. } | CreateStep::Machine { .. } => " ↑↓ navigate │ Enter select │ Esc back",
+        CreateStep::Region { .. } | CreateStep::Machine { .. } | CreateStep::Snapshot { .. } => " ↑↓ navigate │ Enter select │ Esc back",
         CreateStep::Name(_) => " Enter save │ Esc cancel",
     };
     f.render_widget(
@@ -62,10 +66,18 @@ fn draw_create_main_content(f: &mut Frame, area: Rect, state: &CreatePopupState,
     let region_name = REGIONS[state.region_idx].name;
     let region_slug = REGIONS[state.region_idx].slug;
     let machine_name = MACHINES[state.machine_idx].name;
+    let image_name = match state.snapshot_idx {
+        None => "Ubuntu 24.04 (base)".to_string(),
+        Some(i) => {
+            let s = &state.snapshots[i];
+            format!("{} ({:.1} GB)", s.name, s.size_gigabytes)
+        }
+    };
 
     let items = [
         format!("Region:  {region_name} ({region_slug})"),
         format!("Machine: {machine_name}"),
+        format!("Image:   {image_name}"),
         format!("Name:    {}", state.name),
         String::new(),
         "Create".to_string(),
@@ -74,20 +86,20 @@ fn draw_create_main_content(f: &mut Frame, area: Rect, state: &CreatePopupState,
 
     let mut lines: Vec<Line> = vec![Line::raw("")];
     for (i, item) in items.iter().enumerate() {
-        if i == 3 {
+        if i == 4 {
             lines.push(Line::raw(""));
             continue;
         }
-        let real_idx = if i > 3 { i - 1 } else { i };
+        let real_idx = if i > 4 { i - 1 } else { i };
         let is_sel = real_idx == selected;
 
         let style = if is_sel {
-            if i == 4 {
+            if i == 5 {
                 Style::default().fg(Color::Green).add_modifier(Modifier::REVERSED)
             } else {
                 Style::default().fg(Color::White).add_modifier(Modifier::REVERSED)
             }
-        } else if i == 4 {
+        } else if i == 5 {
             Style::default().fg(Color::Green)
         } else {
             Style::default().fg(Color::White)
@@ -98,6 +110,48 @@ fn draw_create_main_content(f: &mut Frame, area: Rect, state: &CreatePopupState,
             Span::raw(prefix),
             Span::styled(item.as_str(), style),
         ]));
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_create_snapshot_content(f: &mut Frame, area: Rect, snapshots: &[SnapshotInfo], selected: usize) {
+    let mut lines: Vec<Line> = vec![Line::raw("")];
+
+    // First option: no snapshot (base image)
+    let is_sel = selected == 0;
+    let style = if is_sel {
+        Style::default().fg(Color::White).add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let prefix = if is_sel { "  > " } else { "    " };
+    lines.push(Line::from(vec![
+        Span::raw(prefix),
+        Span::styled("None (Ubuntu 24.04 base image)", style),
+    ]));
+
+    for (i, snap) in snapshots.iter().enumerate() {
+        let idx = i + 1;
+        let is_sel = idx == selected;
+        let style = if is_sel {
+            Style::default().fg(Color::White).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let prefix = if is_sel { "  > " } else { "    " };
+        lines.push(Line::from(vec![
+            Span::raw(prefix),
+            Span::styled(format!("{}  ({:.1} GB)", snap.name, snap.size_gigabytes), style),
+        ]));
+    }
+
+    if snapshots.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "    No snapshots available",
+            Style::default().fg(Color::DarkGray),
+        ));
     }
 
     f.render_widget(Paragraph::new(lines), area);
@@ -167,6 +221,7 @@ pub fn draw(f: &mut Frame, popup: &Popup, spin: usize) {
         Popup::GithubSetup(phase) => draw_github_setup(f, phase, spin),
         Popup::DoSetup(phase) => draw_do_setup(f, phase, spin),
         Popup::PortInput { input, .. } => draw_port_input(f, input),
+        Popup::SnapshotName { input, .. } => draw_snapshot_name(f, input),
     }
 }
 
@@ -237,12 +292,13 @@ fn draw_create(f: &mut Frame, state: &CreatePopupState, _spin: usize) {
         CreateStep::Main { selected } => draw_create_main(f, state, *selected),
         CreateStep::Region { selected } => draw_create_region(f, *selected),
         CreateStep::Machine { selected } => draw_create_machine(f, *selected),
+        CreateStep::Snapshot { selected } => draw_create_snapshot(f, &state.snapshots, *selected),
         CreateStep::Name(input) => draw_create_name(f, input),
     }
 }
 
 fn draw_create_main(f: &mut Frame, state: &CreatePopupState, selected: usize) {
-    let rect = centered(f.area(), 50, 14);
+    let rect = centered(f.area(), 55, 16);
     f.render_widget(Clear, rect);
 
     let block = Block::default()
@@ -256,10 +312,18 @@ fn draw_create_main(f: &mut Frame, state: &CreatePopupState, selected: usize) {
     let region_name = REGIONS[state.region_idx].name;
     let region_slug = REGIONS[state.region_idx].slug;
     let machine_name = MACHINES[state.machine_idx].name;
+    let image_name = match state.snapshot_idx {
+        None => "Ubuntu 24.04 (base)".to_string(),
+        Some(i) => {
+            let s = &state.snapshots[i];
+            format!("{} ({:.1} GB)", s.name, s.size_gigabytes)
+        }
+    };
 
     let items = [
         format!("Region:  {region_name} ({region_slug})"),
         format!("Machine: {machine_name}"),
+        format!("Image:   {image_name}"),
         format!("Name:    {}", state.name),
         String::new(), // separator
         "Create".to_string(),
@@ -268,20 +332,20 @@ fn draw_create_main(f: &mut Frame, state: &CreatePopupState, selected: usize) {
 
     let mut lines: Vec<Line> = vec![Line::raw("")];
     for (i, item) in items.iter().enumerate() {
-        if i == 3 {
+        if i == 4 {
             lines.push(Line::raw(""));
             continue;
         }
-        let real_idx = if i > 3 { i - 1 } else { i }; // skip separator in index
+        let real_idx = if i > 4 { i - 1 } else { i }; // skip separator in index
         let is_sel = real_idx == selected;
 
         let style = if is_sel {
-            if i == 5 {
+            if i == 6 {
                 // Cancel
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::REVERSED)
-            } else if i == 4 {
+            } else if i == 5 {
                 // Create
                 Style::default()
                     .fg(Color::Green)
@@ -291,7 +355,7 @@ fn draw_create_main(f: &mut Frame, state: &CreatePopupState, selected: usize) {
                     .fg(Color::White)
                     .add_modifier(Modifier::REVERSED)
             }
-        } else if i == 4 {
+        } else if i == 5 {
             Style::default().fg(Color::Green)
         } else {
             Style::default().fg(Color::White)
@@ -301,6 +365,58 @@ fn draw_create_main(f: &mut Frame, state: &CreatePopupState, selected: usize) {
         lines.push(Line::from(vec![
             Span::raw(prefix),
             Span::styled(item.as_str(), style),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  ↑↓ navigate  Enter select  Esc back",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_create_snapshot(f: &mut Frame, snapshots: &[SnapshotInfo], selected: usize) {
+    let h = (snapshots.len() + 1) as u16 + 5; // +1 for "None" option
+    let rect = centered(f.area(), 55, h.max(8));
+    f.render_widget(Clear, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Select Image ")
+        .border_style(Style::default().fg(Color::Green));
+
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut lines: Vec<Line> = vec![Line::raw("")];
+
+    // "None" option
+    let is_sel = selected == 0;
+    let style = if is_sel {
+        Style::default().fg(Color::White).add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let prefix = if is_sel { "  > " } else { "    " };
+    lines.push(Line::from(vec![
+        Span::raw(prefix),
+        Span::styled("None (Ubuntu 24.04 base image)", style),
+    ]));
+
+    for (i, snap) in snapshots.iter().enumerate() {
+        let idx = i + 1;
+        let is_sel = idx == selected;
+        let style = if is_sel {
+            Style::default().fg(Color::White).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let prefix = if is_sel { "  > " } else { "    " };
+        lines.push(Line::from(vec![
+            Span::raw(prefix),
+            Span::styled(format!("{}  ({:.1} GB)", snap.name, snap.size_gigabytes), style),
         ]));
     }
 
@@ -611,6 +727,43 @@ fn draw_do_setup(f: &mut Frame, phase: &DoSetupPhase, spin: usize) {
                 Style::default().fg(Color::DarkGray),
             ));
         }
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ── Snapshot Name ────────────────────────────────────────────────────────
+
+fn draw_snapshot_name(f: &mut Frame, input: &TextInput) {
+    let rect = centered(f.area(), 50, 7);
+    f.render_widget(Clear, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Snapshot Name ")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let display = input.display();
+    let lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  > "),
+            Span::styled(&display, Style::default().fg(Color::White)),
+        ]),
+        Line::raw(""),
+        Line::styled(
+            "  Enter save  Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+
+    let cursor_x = inner.x + 4 + input.cursor as u16;
+    let cursor_y = inner.y + 1;
+    if cursor_x < inner.x + inner.width {
+        f.set_cursor_position((cursor_x, cursor_y));
     }
 
     f.render_widget(Paragraph::new(lines), inner);

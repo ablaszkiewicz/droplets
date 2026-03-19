@@ -28,6 +28,7 @@ pub fn draw(
 
     match state.tab {
         Tab::Droplets => draw_droplets_tab(f, chunks[1], &state.droplets, spin),
+        Tab::Snapshots => draw_snapshots_tab(f, chunks[1], &state.snapshots, spin),
         Tab::Config => draw_config_tab(f, chunks[1], &state.config, spin),
     }
 
@@ -35,26 +36,23 @@ pub fn draw(
 }
 
 fn draw_tab_bar(f: &mut Frame, area: Rect, active: Tab) {
-    let droplets_style = if active == Tab::Droplets {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let config_style = if active == Tab::Config {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-    } else {
-        Style::default().fg(Color::DarkGray)
+    let tab_style = |tab: Tab| {
+        if active == tab {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
     };
 
     let line = Line::from(vec![
         Span::raw(" "),
-        Span::styled(" Droplets ", droplets_style),
+        Span::styled(" Droplets ", tab_style(Tab::Droplets)),
         Span::raw("  "),
-        Span::styled(" Config ", config_style),
+        Span::styled(" Snapshots ", tab_style(Tab::Snapshots)),
+        Span::raw("  "),
+        Span::styled(" Config ", tab_style(Tab::Config)),
         Span::styled(
             "                                        Tab ↹",
             Style::default().fg(Color::DarkGray),
@@ -370,6 +368,20 @@ fn draw_detail_info_window(
                 Span::styled("Set local port...", port_style),
             ]));
             action_idx += 1;
+
+            // Snapshot this droplet
+            let snap_style = if focused && ds.detail_selected == action_idx {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("Snapshot this droplet", snap_style),
+            ]));
+            action_idx += 1;
         }
 
         let del_style = if focused && ds.detail_selected == action_idx {
@@ -563,6 +575,121 @@ fn draw_detail_log_window(
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+// ── Snapshots Tab ───────────────────────────────────────────────────────
+
+fn draw_snapshots_tab(f: &mut Frame, area: Rect, ss: &SnapshotsState, spin: usize) {
+    let chunks =
+        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).split(area);
+
+    draw_snapshots_list(f, chunks[0], ss, spin);
+    draw_snapshot_detail(f, chunks[1], ss);
+}
+
+fn draw_snapshots_list(f: &mut Frame, area: Rect, ss: &SnapshotsState, spin: usize) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Snapshots ")
+        .border_style(Style::default().fg(Color::White));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    if ss.loading && ss.list.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", SPINNER[spin]),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw("Loading..."),
+        ]));
+    }
+
+    for (i, snap) in ss.list.iter().enumerate() {
+        let is_selected = i == ss.selected;
+        let name_style = if is_selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        let size_text = format!(" ({:.1} GB)", snap.size_gigabytes);
+        lines.push(Line::from(vec![
+            Span::styled(" ● ", Style::default().fg(Color::Cyan)),
+            Span::styled(&snap.name, name_style),
+            Span::styled(size_text, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    if !ss.loading && ss.list.is_empty() {
+        lines.push(Line::styled(
+            " No snapshots",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_snapshot_detail(f: &mut Frame, area: Rect, ss: &SnapshotsState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Details ")
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let snap = match ss.list.get(ss.selected) {
+        Some(s) => s,
+        None => {
+            f.render_widget(
+                Paragraph::new(Line::styled(
+                    " No snapshot selected",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                inner,
+            );
+            return;
+        }
+    };
+
+    let ago = time_ago(&snap.created_at);
+    let regions = if snap.regions.is_empty() {
+        "—".to_string()
+    } else {
+        snap.regions.join(", ")
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(" Name:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&snap.name, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(" ID:      ", Style::default().fg(Color::DarkGray)),
+            Span::raw(snap.id.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled(" Created: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(if ago.is_empty() { snap.created_at.clone() } else { ago }),
+        ]),
+        Line::from(vec![
+            Span::styled(" Size:    ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:.2} GB", snap.size_gigabytes)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Regions: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(regions),
+        ]),
+    ];
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 // ── Config Tab ──────────────────────────────────────────────────────────────
 
 fn draw_config_tab(f: &mut Frame, area: Rect, cfg: &ConfigViewState, spin: usize) {
@@ -679,7 +806,7 @@ fn draw_footer(
                 ("↑↓", "navigate"),
                 ("Enter/→", "select"),
                 ("D", "delete"),
-                ("Tab", "config"),
+                ("Tab", "snapshots"),
                 ("q", "quit"),
             ],
             DFocus::DetailInfo => vec![
@@ -707,6 +834,12 @@ fn draw_footer(
                 b
             }
         },
+        Tab::Snapshots => vec![
+            ("↑↓", "navigate"),
+            ("D", "delete"),
+            ("Tab", "config"),
+            ("q", "quit"),
+        ],
         Tab::Config => vec![
             ("←→", "switch"),
             ("↑↓", "navigate"),

@@ -1,5 +1,16 @@
 use std::collections::HashMap;
 
+// ── Snapshot ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct SnapshotInfo {
+    pub id: i64,
+    pub name: String,
+    pub created_at: String,
+    pub size_gigabytes: f64,
+    pub regions: Vec<String>,
+}
+
 // ── Droplet with provisioning state ─────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -81,6 +92,7 @@ pub const PROVISION_STEP_NAMES: &[&str] = &[
     "Verify build-essential",
     "Clone PostHog",
     "Verify PostHog clone",
+    "Pull latest main",
     "Activate Flox environment",
 ];
 

@@ -5,7 +5,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::backend::{config, digitalocean, ssh};
 use crate::types::{
-    DropletInfo, DropletRegistry, LocalStatus, StepStatus, MACHINES, PROVISION_STEP_NAMES, REGIONS,
+    DropletInfo, DropletRegistry, LocalStatus, SnapshotInfo, StepStatus, MACHINES,
+    PROVISION_STEP_NAMES, REGIONS,
 };
 
 // ── Tick constants (1 tick = ~100ms) ────────────────────────────────────────
@@ -13,6 +14,7 @@ use crate::types::{
 const AUTO_ADVANCE_TICKS: u32 = 10; // 1s
 const CHECK_INTERVAL_TICKS: u32 = 50; // 5s
 const REFRESH_INTERVAL_TICKS: u32 = 30; // 3s (faster to catch status changes)
+const SNAPSHOT_REFRESH_INTERVAL_TICKS: u32 = 100; // 10s
 
 // ── Messages from background tasks ─────────────────────────────────────────
 
@@ -38,6 +40,13 @@ pub enum Msg {
     ProvisionStepFailed { name: String, step_idx: usize, error: String },
     ProvisionLog { name: String, step_idx: usize, line: String },
     ProvisionStateChecked { name: String, completed_steps: Vec<bool> },
+
+    // Main: Snapshots
+    SnapshotsLoaded(Vec<SnapshotInfo>),
+    SnapshotCreateDone { name: String },
+    SnapshotCreateFailed { error: String },
+    SnapshotDeleteDone { id: i64 },
+    SnapshotDeleteFailed { error: String },
 
     // Main: Config health checks
     ConfigGithubCheck { success: bool, message: String },
@@ -97,6 +106,7 @@ pub enum WelcomePhase {
 pub struct MainState {
     pub tab: Tab,
     pub droplets: DropletsState,
+    pub snapshots: SnapshotsState,
     pub config: ConfigViewState,
     pub popup: Option<Popup>,
 }
@@ -104,7 +114,15 @@ pub struct MainState {
 #[derive(PartialEq, Clone, Copy)]
 pub enum Tab {
     Droplets,
+    Snapshots,
     Config,
+}
+
+pub struct SnapshotsState {
+    pub list: Vec<SnapshotInfo>,
+    pub selected: usize,
+    pub loading: bool,
+    pub refresh_countdown: u32,
 }
 
 pub struct DropletsState {
@@ -160,11 +178,13 @@ pub enum Popup {
     GithubSetup(GithubSetupPhase),
     DoSetup(DoSetupPhase),
     PortInput { droplet_name: String, input: TextInput },
+    SnapshotName { droplet_id: i64, input: TextInput },
     Message(String),
 }
 
 pub enum PendingAction {
     DeleteDroplet { id: i64, name: String },
+    DeleteSnapshot { id: i64, name: String },
     RegenerateGithubKey,
 }
 
@@ -187,13 +207,16 @@ pub struct CreatePopupState {
     pub step: CreateStep,
     pub region_idx: usize,
     pub machine_idx: usize,
+    pub snapshot_idx: Option<usize>, // None = base image, Some(i) = index into snapshots
     pub name: String,
+    pub snapshots: Vec<SnapshotInfo>,
 }
 
 pub enum CreateStep {
     Main { selected: usize },
     Region { selected: usize },
     Machine { selected: usize },
+    Snapshot { selected: usize }, // 0 = "None (base image)", 1+ = snapshot
     Name(TextInput),
 }
 
@@ -334,6 +357,7 @@ impl App {
 
         let mut do_advance_welcome = false;
         let mut do_refresh_droplets = false;
+        let mut do_refresh_snapshots = false;
         let mut do_check_github = false;
         let mut do_check_do = false;
 
@@ -352,6 +376,13 @@ impl App {
                 } else {
                     main.droplets.refresh_countdown = REFRESH_INTERVAL_TICKS;
                     do_refresh_droplets = true;
+                }
+
+                if main.snapshots.refresh_countdown > 0 {
+                    main.snapshots.refresh_countdown -= 1;
+                } else {
+                    main.snapshots.refresh_countdown = SNAPSHOT_REFRESH_INTERVAL_TICKS;
+                    do_refresh_snapshots = true;
                 }
 
                 if main.config.github.next_check > 0 {
@@ -390,6 +421,9 @@ impl App {
         }
         if do_refresh_droplets {
             self.spawn_refresh_droplets(tx);
+        }
+        if do_refresh_snapshots {
+            self.spawn_refresh_snapshots(tx);
         }
         if do_check_github {
             self.spawn_config_github_check(tx);
@@ -450,6 +484,12 @@ impl App {
                 loading: true,
                 tunnels: HashMap::new(),
             },
+            snapshots: SnapshotsState {
+                list: Vec::new(),
+                selected: 0,
+                loading: true,
+                refresh_countdown: 0,
+            },
             config: ConfigViewState {
                 focus: CFocus::Github,
                 github: KeyCheckInfo {
@@ -498,6 +538,7 @@ impl App {
                 Some(Popup::CreateDroplet(c)) => matches!(c.step, CreateStep::Name(_)),
                 Some(Popup::DoSetup(DoSetupPhase::Input(_))) => true,
                 Some(Popup::PortInput { .. }) => true,
+                Some(Popup::SnapshotName { .. }) => true,
                 _ => false,
             },
         }
@@ -650,12 +691,14 @@ impl App {
         match key.code {
             KeyCode::Tab => {
                 main.tab = match main.tab {
-                    Tab::Droplets => Tab::Config,
+                    Tab::Droplets => Tab::Snapshots,
+                    Tab::Snapshots => Tab::Config,
                     Tab::Config => Tab::Droplets,
                 };
             }
             _ => match main.tab {
                 Tab::Droplets => self.handle_droplets_key(key, tx),
+                Tab::Snapshots => self.handle_snapshots_key(key, tx),
                 Tab::Config => self.handle_config_key(key, tx),
             },
         }
@@ -696,11 +739,14 @@ impl App {
                     }
                 } else {
                     let count = droplet_count;
+                    let snapshots = main.snapshots.list.clone();
                     main.popup = Some(Popup::CreateDroplet(CreatePopupState {
                         step: CreateStep::Main { selected: 0 },
                         region_idx: 2, // nyc1
                         machine_idx: 0,
+                        snapshot_idx: None,
                         name: format!("droplet-{}", count + 1),
+                        snapshots,
                     }));
                 }
             }
@@ -729,7 +775,7 @@ impl App {
 
         let action_count = if let Some(view) = ds.registry.get_by_index(ds.selected) {
             if let Some(api) = &view.api {
-                if api.ip.is_some() { 5 } else { 1 } // Copy SSH, Open SSH, Forward, Set port, Delete  vs  Delete
+                if api.ip.is_some() { 6 } else { 1 } // Copy SSH, Open SSH, Forward, Set port, Snapshot, Delete  vs  Delete
             } else {
                 0
             }
@@ -843,6 +889,12 @@ impl App {
                     main.popup = Some(Popup::PortInput {
                         droplet_name: droplet_name.clone(),
                         input: TextInput::new(&current_port.to_string(), false),
+                    });
+                } else if has_ip && ds.detail_selected == 4 {
+                    // Snapshot this droplet
+                    main.popup = Some(Popup::SnapshotName {
+                        droplet_id,
+                        input: TextInput::new(&format!("{}-snapshot", droplet_name), false),
                     });
                 } else {
                     // Delete
@@ -1001,6 +1053,35 @@ impl App {
         }
     }
 
+    fn handle_snapshots_key(&mut self, key: KeyEvent, _tx: &Sender<Msg>) {
+        let Screen::Main(main) = &mut self.screen else { return };
+        let total = main.snapshots.list.len();
+
+        match key.code {
+            KeyCode::Up => {
+                if main.snapshots.selected > 0 {
+                    main.snapshots.selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if total > 0 && main.snapshots.selected + 1 < total {
+                    main.snapshots.selected += 1;
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                if let Some(snap) = main.snapshots.list.get(main.snapshots.selected) {
+                    let id = snap.id;
+                    let name = snap.name.clone();
+                    main.popup = Some(Popup::Confirm {
+                        message: format!("Delete snapshot '{name}'?"),
+                        action: PendingAction::DeleteSnapshot { id, name },
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
     // ── Popup Key Handling ──────────────────────────────────────────────────
 
     fn handle_popup_key(&mut self, key: KeyEvent, tx: &Sender<Msg>) {
@@ -1067,6 +1148,27 @@ impl App {
                     } else {
                         self.notification = Some(("Invalid port number".to_string(), 30));
                     }
+                }
+                InputResult::Cancel => { main.popup = None; }
+                InputResult::Continue => {}
+            },
+
+            Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
+                InputResult::Submit => {
+                    let name = input.text.clone();
+                    if name.is_empty() { return; }
+                    let did = *droplet_id;
+                    main.popup = None;
+                    self.notification = Some((format!("Creating snapshot '{name}'..."), 50));
+                    let tx = tx.clone();
+                    std::thread::spawn(move || {
+                        let cfg = config::load();
+                        let api_key = cfg.do_api_key.unwrap_or_default();
+                        match digitalocean::create_droplet_snapshot(&api_key, did, &name) {
+                            Ok(()) => { tx.send(Msg::SnapshotCreateDone { name }).ok(); }
+                            Err(e) => { tx.send(Msg::SnapshotCreateFailed { error: e.to_string() }).ok(); }
+                        }
+                    });
                 }
                 InputResult::Cancel => { main.popup = None; }
                 InputResult::Continue => {}
@@ -1176,19 +1278,28 @@ impl App {
         match &mut state.step {
             CreateStep::Main { selected } => match key.code {
                 KeyCode::Up => { if *selected > 0 { *selected -= 1; } }
-                KeyCode::Down => { if *selected < 4 { *selected += 1; } }
+                KeyCode::Down => { if *selected < 5 { *selected += 1; } }
                 KeyCode::Enter => match *selected {
                     0 => { state.step = CreateStep::Region { selected: state.region_idx }; }
                     1 => { state.step = CreateStep::Machine { selected: state.machine_idx }; }
                     2 => {
+                        // Image/Snapshot picker
+                        let cur = state.snapshot_idx.map(|i| i + 1).unwrap_or(0);
+                        state.step = CreateStep::Snapshot { selected: cur };
+                    }
+                    3 => {
                         let name = state.name.clone();
                         state.step = CreateStep::Name(TextInput::new(&name, false));
                     }
-                    3 => {
+                    4 => {
                         // Create
                         let name = state.name.clone();
                         let region = REGIONS[state.region_idx].slug.to_string();
                         let machine = MACHINES[state.machine_idx].slug.to_string();
+                        let image = match state.snapshot_idx {
+                            Some(i) => state.snapshots[i].id.to_string(),
+                            None => "ubuntu-24-04-x64".to_string(),
+                        };
                         main.popup = None;
                         main.droplets.registry.add_creating(name.clone());
                         let tx = tx.clone();
@@ -1204,7 +1315,7 @@ impl App {
                                 }
                             };
 
-                            match digitalocean::create_droplet(&api_key, &name, &region, &machine, &[ssh_key_id]) {
+                            match digitalocean::create_droplet(&api_key, &name, &region, &machine, &[ssh_key_id], &image) {
                                 Ok(_) => {
                                     // Don't send a "done" message. The periodic refresh
                                     // will pick up the new droplet from the API.
@@ -1215,7 +1326,7 @@ impl App {
                             }
                         });
                     }
-                    4 => { main.popup = None; }
+                    5 => { main.popup = None; }
                     _ => {}
                 },
                 KeyCode::Esc => { main.popup = None; }
@@ -1251,15 +1362,29 @@ impl App {
                 }
             }
 
+            CreateStep::Snapshot { selected } => {
+                let total = state.snapshots.len() + 1; // +1 for "None (base image)"
+                match key.code {
+                    KeyCode::Up => { if *selected > 0 { *selected -= 1; } }
+                    KeyCode::Down => { if *selected + 1 < total { *selected += 1; } }
+                    KeyCode::Enter => {
+                        state.snapshot_idx = if *selected == 0 { None } else { Some(*selected - 1) };
+                        state.step = CreateStep::Main { selected: 2 };
+                    }
+                    KeyCode::Esc => { state.step = CreateStep::Main { selected: 2 }; }
+                    _ => {}
+                }
+            }
+
             CreateStep::Name(input) => match input.handle_key(key) {
                 InputResult::Submit => {
                     if !input.text.is_empty() {
                         state.name = input.text.clone();
                     }
-                    state.step = CreateStep::Main { selected: 2 };
+                    state.step = CreateStep::Main { selected: 3 };
                 }
                 InputResult::Cancel => {
-                    state.step = CreateStep::Main { selected: 2 };
+                    state.step = CreateStep::Main { selected: 3 };
                 }
                 InputResult::Continue => {}
             },
@@ -1290,6 +1415,18 @@ impl App {
                         Err(e) => {
                             tx.send(Msg::DropletDeleteFailed { id, error: e.to_string() }).ok();
                         }
+                    }
+                });
+            }
+            PendingAction::DeleteSnapshot { id, ref name } => {
+                self.notification = Some((format!("Deleting snapshot '{name}'..."), 30));
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let cfg = config::load();
+                    let api_key = cfg.do_api_key.unwrap_or_default();
+                    match digitalocean::delete_snapshot(&api_key, id) {
+                        Ok(()) => { tx.send(Msg::SnapshotDeleteDone { id }).ok(); }
+                        Err(e) => { tx.send(Msg::SnapshotDeleteFailed { error: e.to_string() }).ok(); }
                     }
                 });
             }
@@ -1585,6 +1722,42 @@ impl App {
                 }
             }
 
+            Msg::SnapshotsLoaded(snapshots) => {
+                if let Screen::Main(main) = &mut self.screen {
+                    main.snapshots.list = snapshots;
+                    main.snapshots.loading = false;
+                    if main.snapshots.selected >= main.snapshots.list.len() && !main.snapshots.list.is_empty() {
+                        main.snapshots.selected = main.snapshots.list.len() - 1;
+                    }
+                }
+            }
+
+            Msg::SnapshotCreateDone { name } => {
+                self.notification = Some((format!("Snapshot '{name}' creation started"), 50));
+                // Force refresh snapshots
+                if let Screen::Main(main) = &mut self.screen {
+                    main.snapshots.refresh_countdown = 0;
+                }
+            }
+
+            Msg::SnapshotCreateFailed { error } => {
+                self.notification = Some((format!("Snapshot failed: {error}"), 50));
+            }
+
+            Msg::SnapshotDeleteDone { id } => {
+                if let Screen::Main(main) = &mut self.screen {
+                    main.snapshots.list.retain(|s| s.id != id);
+                    if main.snapshots.selected >= main.snapshots.list.len() && !main.snapshots.list.is_empty() {
+                        main.snapshots.selected = main.snapshots.list.len() - 1;
+                    }
+                }
+                self.notification = Some(("Snapshot deleted".to_string(), 30));
+            }
+
+            Msg::SnapshotDeleteFailed { error } => {
+                self.notification = Some((format!("Delete snapshot failed: {error}"), 50));
+            }
+
             Msg::ConfigGithubCheck { success, message } => {
                 if let Screen::Main(main) = &mut self.screen {
                     main.config.github.status = if success { KeyStatus::Ok } else { KeyStatus::Error };
@@ -1643,7 +1816,8 @@ impl App {
                 7 => ssh::provision_verify_build_essential(&droplet_key, &ip, &on_log),
                 8 => ssh::provision_clone_posthog(&droplet_key, &ip, &on_log),
                 9 => ssh::provision_verify_posthog_clone(&droplet_key, &ip, &on_log),
-                10 => ssh::provision_flox_activate(&droplet_key, &ip, &on_log),
+                10 => ssh::provision_pull_latest_main(&droplet_key, &ip, &on_log),
+                11 => ssh::provision_flox_activate(&droplet_key, &ip, &on_log),
                 _ => Ok(()),
             };
 
@@ -1702,6 +1876,21 @@ impl App {
                 }
             } else {
                 tx.send(Msg::DropletsLoaded(vec![])).ok();
+            }
+        });
+    }
+
+    fn spawn_refresh_snapshots(&self, tx: &Sender<Msg>) {
+        let tx = tx.clone();
+        let cfg = config::load();
+        std::thread::spawn(move || {
+            if let Some(api_key) = cfg.do_api_key {
+                match digitalocean::list_snapshots(&api_key) {
+                    Ok(snapshots) => { tx.send(Msg::SnapshotsLoaded(snapshots)).ok(); }
+                    Err(_) => { tx.send(Msg::SnapshotsLoaded(vec![])).ok(); }
+                }
+            } else {
+                tx.send(Msg::SnapshotsLoaded(vec![])).ok();
             }
         });
     }

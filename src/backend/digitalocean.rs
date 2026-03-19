@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
-use crate::types::DropletInfo;
+use crate::types::{DropletInfo, SnapshotInfo};
 
 const BASE: &str = "https://api.digitalocean.com/v2";
 
@@ -122,14 +122,22 @@ pub fn create_droplet(
     region: &str,
     size: &str,
     ssh_key_ids: &[i64],
+    image: &str,
 ) -> Result<DropletInfo> {
+    // If image is a numeric snapshot ID, pass as number; otherwise as string slug
+    let image_value: serde_json::Value = if let Ok(id) = image.parse::<i64>() {
+        serde_json::Value::Number(id.into())
+    } else {
+        serde_json::Value::String(image.to_string())
+    };
+
     let resp = client(api_key)
         .post(format!("{BASE}/droplets"))
         .json(&serde_json::json!({
             "name": name,
             "region": region,
             "size": size,
-            "image": "ubuntu-24-04-x64",
+            "image": image_value,
             "ssh_keys": ssh_key_ids,
         }))
         .send()?;
@@ -224,4 +232,60 @@ pub fn test_account(api_key: &str) -> Result<String> {
     let resp = check(resp)?;
     let body: AccountResp = resp.json().context("parse account")?;
     Ok(body.account.email)
+}
+
+// ── Snapshots ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SnapshotsResp {
+    snapshots: Vec<ApiSnapshot>,
+}
+
+#[derive(Deserialize)]
+struct ApiSnapshot {
+    id: i64,
+    name: String,
+    created_at: String,
+    size_gigabytes: f64,
+    #[serde(default)]
+    regions: Vec<String>,
+}
+
+pub fn list_snapshots(api_key: &str) -> Result<Vec<SnapshotInfo>> {
+    let resp = client(api_key)
+        .get(format!("{BASE}/snapshots?resource_type=droplet"))
+        .send()?;
+    let resp = check(resp)?;
+    let body: SnapshotsResp = resp.json().context("parse snapshots")?;
+    Ok(body
+        .snapshots
+        .into_iter()
+        .map(|s| SnapshotInfo {
+            id: s.id,
+            name: s.name,
+            created_at: s.created_at,
+            size_gigabytes: s.size_gigabytes,
+            regions: s.regions,
+        })
+        .collect())
+}
+
+pub fn create_droplet_snapshot(api_key: &str, droplet_id: i64, name: &str) -> Result<()> {
+    let resp = client(api_key)
+        .post(format!("{BASE}/droplets/{droplet_id}/actions"))
+        .json(&serde_json::json!({
+            "type": "snapshot",
+            "name": name,
+        }))
+        .send()?;
+    check(resp)?;
+    Ok(())
+}
+
+pub fn delete_snapshot(api_key: &str, snapshot_id: i64) -> Result<()> {
+    let resp = client(api_key)
+        .delete(format!("{BASE}/snapshots/{snapshot_id}"))
+        .send()?;
+    check(resp)?;
+    Ok(())
 }
