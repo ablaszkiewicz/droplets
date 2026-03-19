@@ -352,39 +352,25 @@ fn draw_detail_info_window(
             ]));
             action_idx += 1;
 
-            // Port forward toggle
-            let pf = &view.port_forward;
-            let fwd_label = if pf.active {
-                format!("Stop fwd :{} -> :8010", pf.local_port)
+            // Map .droplet hosts entry
+            let hosts_mapped = view.hosts_mapped;
+            let hosts_label = if hosts_mapped {
+                format!("Unmap {}.droplet", view.name)
             } else {
-                format!("Forward :{} -> :8010", pf.local_port)
+                format!("Map {}.droplet", view.name)
             };
-            let fwd_color = if pf.active { Color::Green } else { Color::White };
-            let fwd_style = if focused && ds.detail_selected == action_idx {
+            let hosts_color = if hosts_mapped { Color::Green } else { Color::White };
+            let hosts_style = if focused && ds.detail_selected == action_idx {
                 Style::default()
-                    .fg(fwd_color)
+                    .fg(hosts_color)
                     .add_modifier(Modifier::REVERSED)
             } else {
-                Style::default().fg(fwd_color)
+                Style::default().fg(hosts_color)
             };
-            let fwd_icon = if pf.active { "● " } else { "  " };
+            let hosts_icon = if hosts_mapped { "● " } else { "  " };
             lines.push(Line::from(vec![
-                Span::styled(fwd_icon, Style::default().fg(Color::Green)),
-                Span::styled(fwd_label, fwd_style),
-            ]));
-            action_idx += 1;
-
-            // Set local port
-            let port_style = if focused && ds.detail_selected == action_idx {
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled("Set local port...", port_style),
+                Span::styled(hosts_icon, Style::default().fg(Color::Green)),
+                Span::styled(hosts_label, hosts_style),
             ]));
             action_idx += 1;
 

@@ -220,8 +220,7 @@ pub fn draw(f: &mut Frame, popup: &Popup, spin: usize) {
         Popup::CreateDroplet(state) => draw_create(f, state, spin),
         Popup::GithubSetup(phase) => draw_github_setup(f, phase, spin),
         Popup::DoSetup(phase) => draw_do_setup(f, phase, spin),
-        Popup::PortInput { input, .. } => draw_port_input(f, input),
-        Popup::SnapshotName { input, .. } => draw_snapshot_name(f, input),
+Popup::SnapshotName { input, .. } => draw_snapshot_name(f, input),
         Popup::RenameSnapshot { input, .. } => draw_rename_snapshot(f, input),
         Popup::RenameDroplet { input, .. } => draw_rename_droplet(f, input),
     }
@@ -864,37 +863,3 @@ fn draw_rename_droplet(f: &mut Frame, input: &TextInput) {
 
 // ── Port Input ──────────────────────────────────────────────────────────────
 
-fn draw_port_input(f: &mut Frame, input: &TextInput) {
-    let rect = centered(f.area(), 40, 7);
-    f.render_widget(Clear, rect);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Local Port ")
-        .border_style(Style::default().fg(Color::Cyan));
-
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    let display = input.display();
-    let lines = vec![
-        Line::raw(""),
-        Line::from(vec![
-            Span::raw("  Port: "),
-            Span::styled(&display, Style::default().fg(Color::White)),
-        ]),
-        Line::raw(""),
-        Line::styled(
-            "  Enter save  Esc cancel",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ];
-
-    let cursor_x = inner.x + 8 + input.cursor as u16;
-    let cursor_y = inner.y + 1;
-    if cursor_x < inner.x + inner.width {
-        f.set_cursor_position((cursor_x, cursor_y));
-    }
-
-    f.render_widget(Paragraph::new(lines), inner);
-}

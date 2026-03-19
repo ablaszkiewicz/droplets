@@ -36,6 +36,8 @@ pub enum Msg {
     DropletDeleteFailed { id: i64, error: String },
     DropletRenameDone { id: i64, new_name: String },
     DropletRenameFailed { error: String },
+    HostsMappingDone { name: String, mapped: bool },
+    HostsMappingFailed { error: String },
 
     // Provisioning
     ProvisionStepDone { name: String, step_idx: usize },
@@ -182,8 +184,7 @@ pub enum Popup {
     Confirm { message: String, action: PendingAction },
     GithubSetup(GithubSetupPhase),
     DoSetup(DoSetupPhase),
-    PortInput { droplet_name: String, input: TextInput },
-    SnapshotName { droplet_id: i64, input: TextInput },
+SnapshotName { droplet_id: i64, input: TextInput },
     RenameSnapshot { snapshot_id: String, input: TextInput },
     RenameDroplet { droplet_id: i64, input: TextInput },
     Message(String),
@@ -545,8 +546,7 @@ impl App {
             Screen::Main(m) => match &m.popup {
                 Some(Popup::CreateDroplet(c)) => matches!(c.step, CreateStep::Name(_)),
                 Some(Popup::DoSetup(DoSetupPhase::Input(_))) => true,
-                Some(Popup::PortInput { .. }) => true,
-                Some(Popup::SnapshotName { .. }) => true,
+Some(Popup::SnapshotName { .. }) => true,
                 Some(Popup::RenameSnapshot { .. }) => true,
                 Some(Popup::RenameDroplet { .. }) => true,
                 _ => false,
@@ -785,7 +785,7 @@ impl App {
 
         let action_count = if let Some(view) = ds.registry.get_by_index(ds.selected) {
             if let Some(api) = &view.api {
-                if api.ip.is_some() { 7 } else { 1 } // Copy SSH, Open SSH, Forward, Set port, Snapshot, Rename, Delete  vs  Delete
+                if api.ip.is_some() { 6 } else { 1 } // Copy SSH, Open SSH, .droplet, Snapshot, Rename, Delete
             } else {
                 0
             }
@@ -847,66 +847,71 @@ impl App {
                         }
                     }
                 } else if has_ip && ds.detail_selected == 2 {
-                    // Toggle port forwarding
-                    let droplet_name = droplet_name.clone();
-                    let local_port = ds.registry.get_by_index(ds.selected)
-                        .map(|v| v.port_forward.local_port)
-                        .unwrap_or(28000);
-                    let is_active = ds.registry.get_by_index(ds.selected)
-                        .map(|v| v.port_forward.active)
-                        .unwrap_or(false);
-
-                    if is_active {
-                        // Stop forwarding
-                        if let Some(mut child) = ds.tunnels.remove(&droplet_name) {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                        }
-                        if let Some(view) = ds.registry.get_by_index_mut(ds.selected) {
-                            view.port_forward.active = false;
-                        }
-                        self.notification = Some(("Port forwarding stopped".to_string(), 30));
-                    } else {
-                        // Start forwarding
-                        if let Some(ref ip) = ip {
-                            let cfg = config::load();
-                            let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
-                            match ssh::start_port_forward(&key_path, ip, local_port) {
-                                Ok(child) => {
-                                    ds.tunnels.insert(droplet_name, child);
-                                    if let Some(view) = ds.registry.get_by_index_mut(ds.selected) {
-                                        view.port_forward.active = true;
+                    // Toggle .droplet hosts mapping + auto-start/stop port forward + configure Caddy
+                    if let Some(ref ip) = ip {
+                        let dname = droplet_name.clone();
+                        let ip_for_thread = ip.clone();
+                        let tx = _tx.clone();
+                        let is_currently_mapped = ds.registry.get_by_index(ds.selected)
+                            .map(|v| v.hosts_mapped)
+                            .unwrap_or(false);
+                        let local_port = ds.registry.get_by_index(ds.selected)
+                            .map(|v| v.port_forward.local_port)
+                            .unwrap_or(28000);
+                        let dname_for_thread = dname.clone();
+                        std::thread::spawn(move || {
+                            match ssh::toggle_host_mapping(&dname_for_thread, local_port) {
+                                Ok(mapped) => {
+                                    // If mapping ON, also configure Caddy to accept any host
+                                    if mapped {
+                                        let cfg = config::load();
+                                        let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
+                                        if let Err(e) = ssh::configure_caddy_any_host(&key_path, &ip_for_thread) {
+                                            tx.send(Msg::HostsMappingFailed { error: format!("Caddy config failed: {e}") }).ok();
+                                            return;
+                                        }
                                     }
-                                    self.notification = Some((
-                                        format!("Forwarding localhost:{local_port} -> remote:8010"),
-                                        30,
-                                    ));
+                                    tx.send(Msg::HostsMappingDone { name: dname_for_thread, mapped }).ok();
                                 }
-                                Err(e) => {
-                                    self.notification = Some((
-                                        format!("Port forward failed: {e}"),
-                                        50,
-                                    ));
+                                Err(e) => { tx.send(Msg::HostsMappingFailed { error: e.to_string() }).ok(); }
+                            }
+                        });
+                        if !is_currently_mapped {
+                            // Mapping ON: auto-start port forwarding if not already active
+                            let is_active = ds.registry.get_by_index(ds.selected)
+                                .map(|v| v.port_forward.active)
+                                .unwrap_or(false);
+                            if !is_active {
+                                let cfg = config::load();
+                                let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
+                                match ssh::start_port_forward(&key_path, ip, local_port) {
+                                    Ok(child) => {
+                                        ds.tunnels.insert(droplet_name.clone(), child);
+                                        if let Some(view) = ds.registry.get_by_index_mut(ds.selected) {
+                                            view.port_forward.active = true;
+                                        }
+                                    }
+                                    Err(_) => {}
                                 }
+                            }
+                        } else {
+                            // Mapping OFF: also stop port forwarding
+                            if let Some(mut child) = ds.tunnels.remove(&dname) {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                            }
+                            if let Some(view) = ds.registry.get_by_index_mut(ds.selected) {
+                                view.port_forward.active = false;
                             }
                         }
                     }
                 } else if has_ip && ds.detail_selected == 3 {
-                    // Set local port
-                    let current_port = ds.registry.get_by_index(ds.selected)
-                        .map(|v| v.port_forward.local_port)
-                        .unwrap_or(28000);
-                    main.popup = Some(Popup::PortInput {
-                        droplet_name: droplet_name.clone(),
-                        input: TextInput::new(&current_port.to_string(), false),
-                    });
-                } else if has_ip && ds.detail_selected == 4 {
                     // Snapshot this droplet
                     main.popup = Some(Popup::SnapshotName {
                         droplet_id,
                         input: TextInput::new(&format!("{}-snapshot", droplet_name), false),
                     });
-                } else if has_ip && ds.detail_selected == 5 {
+                } else if has_ip && ds.detail_selected == 4 {
                     // Rename droplet
                     main.popup = Some(Popup::RenameDroplet {
                         droplet_id,
@@ -1136,50 +1141,7 @@ impl App {
                 }
             }
 
-            Popup::PortInput { droplet_name, input } => match input.handle_key(key) {
-                InputResult::Submit => {
-                    if let Ok(port) = input.text.parse::<u16>() {
-                        if port >= 1024 {
-                            let name = droplet_name.clone();
-                            // If tunnel is active, restart with new port
-                            let was_active = if let Some(mut child) = main.droplets.tunnels.remove(&name) {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                                true
-                            } else {
-                                false
-                            };
-                            if let Some(view) = main.droplets.registry.find_by_name_mut(&name) {
-                                view.port_forward.local_port = port;
-                                if was_active {
-                                    view.port_forward.active = false;
-                                    // Restart with new port
-                                    if let Some(api) = &view.api {
-                                        if let Some(ref ip) = api.ip {
-                                            let cfg = config::load();
-                                            let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
-                                            if let Ok(child) = ssh::start_port_forward(&key_path, ip, port) {
-                                                main.droplets.tunnels.insert(name.clone(), child);
-                                                view.port_forward.active = true;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            main.popup = None;
-                            self.notification = Some((format!("Local port set to {port}"), 30));
-                        } else {
-                            self.notification = Some(("Port must be >= 1024".to_string(), 30));
-                        }
-                    } else {
-                        self.notification = Some(("Invalid port number".to_string(), 30));
-                    }
-                }
-                InputResult::Cancel => { main.popup = None; }
-                InputResult::Continue => {}
-            },
-
-            Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
+Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
                 InputResult::Submit => {
                     let name = input.text.clone();
                     if name.is_empty() { return; }
@@ -1677,6 +1639,11 @@ impl App {
                             view.provision.needs_check = false;
                         }
                     }
+
+                    // Sync hosts mapping state from /etc/hosts
+                    for view in main.droplets.registry.views.iter_mut() {
+                        view.hosts_mapped = ssh::is_host_mapped(&view.name);
+                    }
                 }
 
                 for (name, ip) in needs_check {
@@ -1720,6 +1687,29 @@ impl App {
 
             Msg::DropletRenameFailed { error } => {
                 self.notification = Some((format!("Rename failed: {error}"), 50));
+            }
+
+            Msg::HostsMappingDone { name, mapped } => {
+                if let Screen::Main(main) = &mut self.screen {
+                    if let Some(view) = main.droplets.registry.find_by_name_mut(&name) {
+                        view.hosts_mapped = mapped;
+                    }
+                    if mapped {
+                        self.notification = Some((
+                            format!("http://{name}.droplet ready"),
+                            50,
+                        ));
+                    } else {
+                        self.notification = Some((
+                            format!("{name}.droplet removed from /etc/hosts"),
+                            30,
+                        ));
+                    }
+                }
+            }
+
+            Msg::HostsMappingFailed { error } => {
+                self.notification = Some((format!("Hosts mapping failed: {error}"), 50));
             }
 
             Msg::ProvisionStepDone { name, step_idx } => {

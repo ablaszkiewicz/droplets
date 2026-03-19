@@ -33,6 +33,7 @@ pub struct DropletView {
     pub local_status: LocalStatus,
     pub provision: ProvisionState,
     pub port_forward: PortForwardInfo,
+    pub hosts_mapped: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +225,7 @@ impl DropletRegistry {
                     local_status: LocalStatus::Normal,
                     provision: ps,
                     port_forward: PortForwardInfo::new(),
+                    hosts_mapped: false,
                 });
             }
         }
@@ -236,6 +238,7 @@ impl DropletRegistry {
             local_status: LocalStatus::Creating,
             provision: ProvisionState::new(),
             port_forward: PortForwardInfo::new(),
+            hosts_mapped: false,
         });
     }
 

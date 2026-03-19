@@ -146,6 +146,72 @@ pub fn test_do_api_key(api_key: &str) -> (bool, String) {
     }
 }
 
+// ── /etc/hosts + pfctl mapping ──────────────────────────────────────────────
+
+/// Derive a unique loopback IP from the local port (127.0.0.2, .3, …).
+pub fn loopback_ip_for_port(local_port: u16) -> String {
+    let octet = (local_port.saturating_sub(28000) + 2).min(254) as u8;
+    format!("127.0.0.{octet}")
+}
+
+pub fn is_host_mapped(name: &str) -> bool {
+    let Ok(hosts) = std::fs::read_to_string("/etc/hosts") else { return false };
+    let pattern = format!("{name}.droplet");
+    hosts.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with('#') && trimmed.ends_with(&pattern)
+    })
+}
+
+/// Map or unmap `<name>.droplet` via /etc/hosts + pfctl port-80 redirect.
+/// Uses osascript for admin privileges (macOS password dialog).
+/// Returns `true` if now mapped, `false` if unmapped.
+pub fn toggle_host_mapping(name: &str, local_port: u16) -> Result<bool> {
+    let mapped = is_host_mapped(name);
+    let loopback = loopback_ip_for_port(local_port);
+
+    let script = if mapped {
+        format!(
+            r#"do shell script "sed -i '' '/{}\\.droplet/d' /etc/hosts && pfctl -a com.apple/droplets.{} -F all 2>/dev/null; dscacheutil -flushcache && killall -HUP mDNSResponder" with administrator privileges"#,
+            name, name
+        )
+    } else {
+        format!(
+            r#"do shell script "echo '{loopback} {name}.droplet' >> /etc/hosts && echo 'rdr pass on lo0 inet proto tcp from any to {loopback} port 80 -> 127.0.0.1 port {local_port}' | pfctl -a com.apple/droplets.{name} -f - 2>/dev/null && pfctl -e 2>/dev/null; dscacheutil -flushcache && killall -HUP mDNSResponder" with administrator privileges"#,
+        )
+    };
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("User canceled") || stderr.contains("cancelled") {
+            bail!("Cancelled by user");
+        }
+        bail!("{}", stderr.trim());
+    }
+
+    Ok(!mapped)
+}
+
+/// Configure Caddy on the remote droplet to accept any hostname.
+/// Sets CADDY_HOST=:8000 in PostHog's .env and restarts the proxy container.
+pub fn configure_caddy_any_host(droplet_key: &str, ip: &str) -> Result<()> {
+    ssh_run(
+        droplet_key,
+        ip,
+        "docker exec $(docker ps -qf name=proxy) sh -c \"\
+         sed -i 's|http://localhost:8000|:8000|' /etc/caddy/Caddyfile && \
+         caddy reload -c /etc/caddy/Caddyfile\"",
+    )?;
+    Ok(())
+}
+
+// ── Clipboard / Terminal ────────────────────────────────────────────────────
+
 pub fn copy_to_clipboard(text: &str) -> bool {
     let child = Command::new("pbcopy")
         .stdin(Stdio::piped())
@@ -204,7 +270,7 @@ pub fn start_port_forward(
         .arg("ServerAliveCountMax=3")
         .arg("-N")
         .arg("-L")
-        .arg(format!("{local_port}:localhost:8010"))
+        .arg(format!("127.0.0.1:{local_port}:localhost:8010"))
         .arg(format!("root@{ip}"))
         .spawn()?;
     Ok(child)
