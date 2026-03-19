@@ -95,6 +95,8 @@ pub const PROVISION_STEP_NAMES: &[&str] = &[
     "Verify PostHog clone",
     "Pull latest main",
     "Activate Flox environment",
+    "Install tmux",
+    "Start hogli",
 ];
 
 impl ProvisionState {

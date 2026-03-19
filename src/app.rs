@@ -823,7 +823,21 @@ Some(Popup::SnapshotName { .. }) => true,
                 let ip = api.ip.clone();
 
                 if has_ip && ds.detail_selected == 0 {
-                    // Copy SSH cmd
+                    // Copy "attach to hogli" command
+                    if let Some(ip) = ip {
+                        let cfg = config::load();
+                        let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
+                        let cmd = format!(
+                            "ssh -i {key_path} -o StrictHostKeyChecking=accept-new -t root@{ip} 'tmux attach -t hogli'"
+                        );
+                        let copied = ssh::copy_to_clipboard(&cmd);
+                        self.notification = Some((
+                            if copied { format!("Copied: {cmd}") } else { cmd },
+                            30,
+                        ));
+                    }
+                } else if has_ip && ds.detail_selected == 1 {
+                    // Copy "open shell" command
                     if let Some(ip) = ip {
                         let cfg = config::load();
                         let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
@@ -835,17 +849,6 @@ Some(Popup::SnapshotName { .. }) => true,
                             if copied { format!("Copied: {cmd}") } else { cmd },
                             30,
                         ));
-                    }
-                } else if has_ip && ds.detail_selected == 1 {
-                    // Open SSH in terminal
-                    if let Some(ip) = ip {
-                        let cfg = config::load();
-                        let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
-                        if ssh::open_ssh_in_terminal(&key_path, &ip) {
-                            self.notification = Some(("Opened SSH in Terminal.app".to_string(), 30));
-                        } else {
-                            self.notification = Some(("Failed to open terminal".to_string(), 30));
-                        }
                     }
                 } else if has_ip && ds.detail_selected == 2 {
                     // Toggle .droplet hosts mapping + auto-start/stop port forward + configure Caddy
@@ -1696,8 +1699,12 @@ Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
                         view.hosts_mapped = mapped;
                     }
                     if mapped {
+                        let port = main.droplets.registry.views().iter()
+                            .find(|v| v.name == name)
+                            .map(|v| v.port_forward.local_port)
+                            .unwrap_or(28000);
                         self.notification = Some((
-                            format!("http://{name}.droplet ready"),
+                            format!("http://{name}.droplet:{port} ready"),
                             50,
                         ));
                     } else {
@@ -1925,6 +1932,8 @@ Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
                 9 => ssh::provision_verify_posthog_clone(&droplet_key, &ip, &on_log),
                 10 => ssh::provision_pull_latest_main(&droplet_key, &ip, &on_log),
                 11 => ssh::provision_flox_activate(&droplet_key, &ip, &on_log),
+                12 => ssh::provision_install_tmux(&droplet_key, &ip, &on_log),
+                13 => ssh::provision_start_hogli(&droplet_key, &ip, &on_log),
                 _ => Ok(()),
             };
 

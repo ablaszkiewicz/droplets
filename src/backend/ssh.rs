@@ -148,12 +148,6 @@ pub fn test_do_api_key(api_key: &str) -> (bool, String) {
 
 // ── /etc/hosts + pfctl mapping ──────────────────────────────────────────────
 
-/// Derive a unique loopback IP from the local port (127.0.0.2, .3, …).
-pub fn loopback_ip_for_port(local_port: u16) -> String {
-    let octet = (local_port.saturating_sub(28000) + 2).min(254) as u8;
-    format!("127.0.0.{octet}")
-}
-
 pub fn is_host_mapped(name: &str) -> bool {
     let Ok(hosts) = std::fs::read_to_string("/etc/hosts") else { return false };
     let pattern = format!("{name}.droplet");
@@ -163,21 +157,20 @@ pub fn is_host_mapped(name: &str) -> bool {
     })
 }
 
-/// Map or unmap `<name>.droplet` via /etc/hosts + pfctl port-80 redirect.
+/// Map or unmap `<name>.droplet` via /etc/hosts.
 /// Uses osascript for admin privileges (macOS password dialog).
 /// Returns `true` if now mapped, `false` if unmapped.
-pub fn toggle_host_mapping(name: &str, local_port: u16) -> Result<bool> {
+pub fn toggle_host_mapping(name: &str, _local_port: u16) -> Result<bool> {
     let mapped = is_host_mapped(name);
-    let loopback = loopback_ip_for_port(local_port);
 
     let script = if mapped {
         format!(
-            r#"do shell script "sed -i '' '/{}\\.droplet/d' /etc/hosts && pfctl -a com.apple/droplets.{} -F all 2>/dev/null; dscacheutil -flushcache && killall -HUP mDNSResponder" with administrator privileges"#,
-            name, name
+            r#"do shell script "sed -i '' '/{}\\.droplet/d' /etc/hosts; dscacheutil -flushcache && killall -HUP mDNSResponder" with administrator privileges"#,
+            name
         )
     } else {
         format!(
-            r#"do shell script "echo '{loopback} {name}.droplet' >> /etc/hosts && echo 'rdr pass on lo0 inet proto tcp from any to {loopback} port 80 -> 127.0.0.1 port {local_port}' | pfctl -a com.apple/droplets.{name} -f - 2>/dev/null && pfctl -e 2>/dev/null; dscacheutil -flushcache && killall -HUP mDNSResponder" with administrator privileges"#,
+            r#"do shell script "echo '127.0.0.1 {name}.droplet' >> /etc/hosts; dscacheutil -flushcache && killall -HUP mDNSResponder" with administrator privileges"#,
         )
     };
 
@@ -198,13 +191,16 @@ pub fn toggle_host_mapping(name: &str, local_port: u16) -> Result<bool> {
 }
 
 /// Configure Caddy on the remote droplet to accept any hostname.
-/// Sets CADDY_HOST=:8000 in PostHog's .env and restarts the proxy container.
+/// Replaces `http://localhost:8000` with `:8000` (accept any Host) and adds
+/// `request_header Host localhost` so upstream services see a known-good Host.
 pub fn configure_caddy_any_host(droplet_key: &str, ip: &str) -> Result<()> {
     ssh_run(
         droplet_key,
         ip,
         "docker exec $(docker ps -qf name=proxy) sh -c \"\
-         sed -i 's|http://localhost:8000|:8000|' /etc/caddy/Caddyfile && \
+         sed -i 's|http://localhost:8000|:8000|' /etc/caddy/Caddyfile; \
+         grep -q 'request_header Host' /etc/caddy/Caddyfile || \
+         sed -i 's/:8000 {/:8000 {\\n    request_header Host localhost/' /etc/caddy/Caddyfile; \
          caddy reload -c /etc/caddy/Caddyfile\"",
     )?;
     Ok(())
@@ -226,27 +222,6 @@ pub fn copy_to_clipboard(text: &str) -> bool {
         }
         Err(_) => false,
     }
-}
-
-pub fn open_ssh_in_terminal(key_path: &str, ip: &str) -> bool {
-    let ssh_cmd = format!(
-        "ssh -i {key_path} -o StrictHostKeyChecking=accept-new root@{ip}"
-    );
-    let script = format!(
-        "tell application \"Terminal\"\n\
-         \tactivate\n\
-         \tdo script \"{ssh_cmd}\"\n\
-         end tell"
-    );
-    Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|_| true)
-        .unwrap_or(false)
 }
 
 pub fn start_port_forward(
@@ -678,5 +653,55 @@ pub fn provision_flox_activate(
         on_log,
     )?;
     write_provision_marker(droplet_key, ip, 11)?;
+    Ok(())
+}
+
+/// Step 12: Install tmux (needed for persistent hogli session).
+pub fn provision_install_tmux(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    ssh_run_logged(
+        droplet_key,
+        ip,
+        "which tmux >/dev/null 2>&1 && echo 'tmux already installed' || \
+         (apt-get update -qq && apt-get install -y -qq tmux && echo 'tmux installed')",
+        on_log,
+    )?;
+    write_provision_marker(droplet_key, ip, 12)?;
+    Ok(())
+}
+
+/// Step 13: Start hogli inside a detached tmux session.
+pub fn provision_start_hogli(
+    droplet_key: &str,
+    ip: &str,
+    on_log: &dyn Fn(&str),
+) -> Result<()> {
+    // Kill any existing session, then start fresh.
+    // remain-on-exit keeps the tmux window alive if the command crashes.
+    // flox activate modifies the current shell, so we must send it as keystrokes
+    // and wait for it to finish (the prompt changes to "flox [") before sending
+    // hogli start.
+    ssh_run_logged(
+        droplet_key,
+        ip,
+        "tmux kill-session -t hogli 2>/dev/null; \
+         tmux new-session -d -s hogli -c /root/posthog && \
+         tmux set-option -t hogli remain-on-exit on && \
+         tmux send-keys -t hogli 'flox activate' Enter && \
+         echo 'Waiting for flox to activate...' && \
+         for i in $(seq 1 120); do \
+           if tmux capture-pane -t hogli -p | grep -q 'flox \\['; then \
+             echo 'Flox activated'; break; \
+           fi; \
+           sleep 1; \
+         done && \
+         tmux send-keys -t hogli 'hogli start' Enter && \
+         echo 'hogli tmux session started'",
+        on_log,
+    )?;
+    write_provision_marker(droplet_key, ip, 13)?;
     Ok(())
 }

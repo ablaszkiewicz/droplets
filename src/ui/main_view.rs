@@ -326,7 +326,7 @@ fn draw_detail_info_window(
         let mut action_idx = 0;
 
         if view.api.as_ref().and_then(|a| a.ip.as_ref()).is_some() {
-            let style = if focused && ds.detail_selected == action_idx {
+            let attach_style = if focused && ds.detail_selected == action_idx {
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::REVERSED)
@@ -335,11 +335,11 @@ fn draw_detail_info_window(
             };
             lines.push(Line::from(vec![
                 Span::raw(" "),
-                Span::styled("Copy SSH cmd", style),
+                Span::styled("Attach to hogli", attach_style),
             ]));
             action_idx += 1;
 
-            let open_style = if focused && ds.detail_selected == action_idx {
+            let shell_style = if focused && ds.detail_selected == action_idx {
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::REVERSED)
@@ -348,7 +348,7 @@ fn draw_detail_info_window(
             };
             lines.push(Line::from(vec![
                 Span::raw(" "),
-                Span::styled("Open SSH in terminal", open_style),
+                Span::styled("Open shell", shell_style),
             ]));
             action_idx += 1;
 
