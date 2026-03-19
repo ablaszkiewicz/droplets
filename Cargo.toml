@@ -1,0 +1,18 @@
+[package]
+name = "droplets"
+version = "0.1.0"
+edition = "2021"
+description = "TUI for managing DigitalOcean droplets with automated provisioning"
+license = "MIT"
+repository = "https://github.com/ablaszkiewicz/droplets"
+keywords = ["digitalocean", "tui", "droplet", "ssh", "devtools"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+dirs = "6"
+anyhow = "1"
