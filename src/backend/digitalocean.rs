@@ -146,6 +146,18 @@ pub fn create_droplet(
     Ok(body.droplet.into_info())
 }
 
+pub fn rename_droplet(api_key: &str, id: i64, new_name: &str) -> Result<()> {
+    let resp = client(api_key)
+        .post(format!("{BASE}/droplets/{id}/actions"))
+        .json(&serde_json::json!({
+            "type": "rename",
+            "name": new_name,
+        }))
+        .send()?;
+    check(resp)?;
+    Ok(())
+}
+
 pub fn delete_droplet(api_key: &str, id: i64) -> Result<()> {
     let resp = client(api_key)
         .delete(format!("{BASE}/droplets/{id}"))
@@ -243,7 +255,7 @@ struct SnapshotsResp {
 
 #[derive(Deserialize)]
 struct ApiSnapshot {
-    id: i64,
+    id: serde_json::Value, // DO returns this as int or string depending on endpoint
     name: String,
     created_at: String,
     size_gigabytes: f64,
@@ -251,21 +263,34 @@ struct ApiSnapshot {
     regions: Vec<String>,
 }
 
+impl ApiSnapshot {
+    fn id_string(&self) -> String {
+        match &self.id {
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    }
+}
+
 pub fn list_snapshots(api_key: &str) -> Result<Vec<SnapshotInfo>> {
     let resp = client(api_key)
-        .get(format!("{BASE}/snapshots?resource_type=droplet"))
+        .get(format!("{BASE}/snapshots?resource_type=droplet&per_page=200"))
         .send()?;
     let resp = check(resp)?;
     let body: SnapshotsResp = resp.json().context("parse snapshots")?;
     Ok(body
         .snapshots
         .into_iter()
-        .map(|s| SnapshotInfo {
-            id: s.id,
-            name: s.name,
-            created_at: s.created_at,
-            size_gigabytes: s.size_gigabytes,
-            regions: s.regions,
+        .map(|s| {
+            let id_str = s.id_string();
+            SnapshotInfo {
+                id: id_str,
+                name: s.name,
+                created_at: s.created_at,
+                size_gigabytes: s.size_gigabytes,
+                regions: s.regions,
+            }
         })
         .collect())
 }
@@ -282,10 +307,22 @@ pub fn create_droplet_snapshot(api_key: &str, droplet_id: i64, name: &str) -> Re
     Ok(())
 }
 
-pub fn delete_snapshot(api_key: &str, snapshot_id: i64) -> Result<()> {
+pub fn delete_snapshot(api_key: &str, snapshot_id: &str) -> Result<()> {
     let resp = client(api_key)
         .delete(format!("{BASE}/snapshots/{snapshot_id}"))
         .send()?;
     check(resp)?;
     Ok(())
 }
+
+pub fn rename_snapshot(api_key: &str, snapshot_id: &str, new_name: &str) -> Result<()> {
+    let resp = client(api_key)
+        .put(format!("{BASE}/images/{snapshot_id}"))
+        .json(&serde_json::json!({
+            "name": new_name,
+        }))
+        .send()?;
+    check(resp)?;
+    Ok(())
+}
+

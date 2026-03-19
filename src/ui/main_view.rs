@@ -90,7 +90,7 @@ fn draw_droplets_list(f: &mut Frame, area: Rect, ds: &DropletsState, spin: usize
     let views = ds.registry.views();
 
     for (i, view) in views.iter().enumerate() {
-        let is_selected = i == ds.selected && focused;
+        let is_selected = i == ds.selected;
 
         let (icon, icon_color) = match view.local_status {
             LocalStatus::Creating => (SPINNER[spin], Color::Yellow),
@@ -131,10 +131,14 @@ fn draw_droplets_list(f: &mut Frame, area: Rect, ds: &DropletsState, spin: usize
             }
         };
 
-        let name_style = if is_selected {
+        let name_style = if is_selected && focused {
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::REVERSED)
+        } else if is_selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             Style::default().fg(Color::White)
         };
@@ -397,6 +401,20 @@ fn draw_detail_info_window(
                 Span::styled("Snapshot this droplet", snap_style),
             ]));
             action_idx += 1;
+
+            // Rename droplet
+            let rename_style = if focused && ds.detail_selected == action_idx {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("Rename droplet", rename_style),
+            ]));
+            action_idx += 1;
         }
 
         let del_style = if focused && ds.detail_selected == action_idx {
@@ -640,7 +658,16 @@ fn draw_snapshots_list(f: &mut Frame, area: Rect, ss: &SnapshotsState, spin: usi
         ]));
     }
 
-    if !ss.loading && ss.list.is_empty() {
+    // Show pending snapshots with spinner
+    for name in &ss.pending {
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} ", SPINNER[spin]), Style::default().fg(Color::Yellow)),
+            Span::styled(name, Style::default().fg(Color::Yellow)),
+            Span::styled(" (creating...)", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    if !ss.loading && ss.list.is_empty() && ss.pending.is_empty() {
         lines.push(Line::styled(
             " No snapshots",
             Style::default().fg(Color::DarkGray),
@@ -857,6 +884,7 @@ fn draw_footer(
         },
         Tab::Snapshots => vec![
             ("↑↓", "navigate"),
+            ("R", "rename"),
             ("D", "delete"),
             ("Tab", "config"),
             ("q", "quit"),

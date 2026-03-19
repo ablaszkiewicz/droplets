@@ -34,6 +34,8 @@ pub enum Msg {
     DropletsLoaded(Vec<DropletInfo>),
     DropletCreateFailed { name: String, error: String },
     DropletDeleteFailed { id: i64, error: String },
+    DropletRenameDone { id: i64, new_name: String },
+    DropletRenameFailed { error: String },
 
     // Provisioning
     ProvisionStepDone { name: String, step_idx: usize },
@@ -45,8 +47,10 @@ pub enum Msg {
     SnapshotsLoaded(Vec<SnapshotInfo>),
     SnapshotCreateDone { name: String },
     SnapshotCreateFailed { error: String },
-    SnapshotDeleteDone { id: i64 },
+    SnapshotDeleteDone { id: String },
     SnapshotDeleteFailed { error: String },
+    SnapshotRenameDone { id: String, new_name: String },
+    SnapshotRenameFailed { error: String },
 
     // Main: Config health checks
     ConfigGithubCheck { success: bool, message: String },
@@ -123,6 +127,7 @@ pub struct SnapshotsState {
     pub selected: usize,
     pub loading: bool,
     pub refresh_countdown: u32,
+    pub pending: Vec<String>, // snapshot names we're waiting to appear
 }
 
 pub struct DropletsState {
@@ -179,12 +184,14 @@ pub enum Popup {
     DoSetup(DoSetupPhase),
     PortInput { droplet_name: String, input: TextInput },
     SnapshotName { droplet_id: i64, input: TextInput },
+    RenameSnapshot { snapshot_id: String, input: TextInput },
+    RenameDroplet { droplet_id: i64, input: TextInput },
     Message(String),
 }
 
 pub enum PendingAction {
     DeleteDroplet { id: i64, name: String },
-    DeleteSnapshot { id: i64, name: String },
+    DeleteSnapshot { id: String, name: String },
     RegenerateGithubKey,
 }
 
@@ -489,6 +496,7 @@ impl App {
                 selected: 0,
                 loading: true,
                 refresh_countdown: 0,
+                pending: Vec::new(),
             },
             config: ConfigViewState {
                 focus: CFocus::Github,
@@ -539,6 +547,8 @@ impl App {
                 Some(Popup::DoSetup(DoSetupPhase::Input(_))) => true,
                 Some(Popup::PortInput { .. }) => true,
                 Some(Popup::SnapshotName { .. }) => true,
+                Some(Popup::RenameSnapshot { .. }) => true,
+                Some(Popup::RenameDroplet { .. }) => true,
                 _ => false,
             },
         }
@@ -775,7 +785,7 @@ impl App {
 
         let action_count = if let Some(view) = ds.registry.get_by_index(ds.selected) {
             if let Some(api) = &view.api {
-                if api.ip.is_some() { 6 } else { 1 } // Copy SSH, Open SSH, Forward, Set port, Snapshot, Delete  vs  Delete
+                if api.ip.is_some() { 7 } else { 1 } // Copy SSH, Open SSH, Forward, Set port, Snapshot, Rename, Delete  vs  Delete
             } else {
                 0
             }
@@ -895,6 +905,12 @@ impl App {
                     main.popup = Some(Popup::SnapshotName {
                         droplet_id,
                         input: TextInput::new(&format!("{}-snapshot", droplet_name), false),
+                    });
+                } else if has_ip && ds.detail_selected == 5 {
+                    // Rename droplet
+                    main.popup = Some(Popup::RenameDroplet {
+                        droplet_id,
+                        input: TextInput::new(&droplet_name, false),
                     });
                 } else {
                     // Delete
@@ -1068,9 +1084,19 @@ impl App {
                     main.snapshots.selected += 1;
                 }
             }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                if let Some(snap) = main.snapshots.list.get(main.snapshots.selected) {
+                    let id = snap.id.clone();
+                    let name = snap.name.clone();
+                    main.popup = Some(Popup::RenameSnapshot {
+                        snapshot_id: id,
+                        input: TextInput::new(&name, false),
+                    });
+                }
+            }
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 if let Some(snap) = main.snapshots.list.get(main.snapshots.selected) {
-                    let id = snap.id;
+                    let id = snap.id.clone();
                     let name = snap.name.clone();
                     main.popup = Some(Popup::Confirm {
                         message: format!("Delete snapshot '{name}'?"),
@@ -1169,6 +1195,50 @@ impl App {
                             Err(e) => { tx.send(Msg::SnapshotCreateFailed { error: e.to_string() }).ok(); }
                         }
                     });
+                }
+                InputResult::Cancel => { main.popup = None; }
+                InputResult::Continue => {}
+            },
+
+            Popup::RenameSnapshot { snapshot_id, input } => match input.handle_key(key) {
+                InputResult::Submit => {
+                    let new_name = input.text.clone();
+                    if new_name.is_empty() { return; }
+                    let sid = snapshot_id.clone();
+                    main.popup = None;
+                    let tx = tx.clone();
+                    let name_clone = new_name.clone();
+                    std::thread::spawn(move || {
+                        let cfg = config::load();
+                        let api_key = cfg.do_api_key.unwrap_or_default();
+                        match digitalocean::rename_snapshot(&api_key, &sid, &name_clone) {
+                            Ok(()) => { tx.send(Msg::SnapshotRenameDone { id: sid, new_name: name_clone }).ok(); }
+                            Err(e) => { tx.send(Msg::SnapshotRenameFailed { error: e.to_string() }).ok(); }
+                        }
+                    });
+                    self.notification = Some((format!("Renamed to '{new_name}'"), 30));
+                }
+                InputResult::Cancel => { main.popup = None; }
+                InputResult::Continue => {}
+            },
+
+            Popup::RenameDroplet { droplet_id, input } => match input.handle_key(key) {
+                InputResult::Submit => {
+                    let new_name = input.text.clone();
+                    if new_name.is_empty() { return; }
+                    let did = *droplet_id;
+                    main.popup = None;
+                    let tx = tx.clone();
+                    let name_clone = new_name.clone();
+                    std::thread::spawn(move || {
+                        let cfg = config::load();
+                        let api_key = cfg.do_api_key.unwrap_or_default();
+                        match digitalocean::rename_droplet(&api_key, did, &name_clone) {
+                            Ok(()) => { tx.send(Msg::DropletRenameDone { id: did, new_name: name_clone }).ok(); }
+                            Err(e) => { tx.send(Msg::DropletRenameFailed { error: e.to_string() }).ok(); }
+                        }
+                    });
+                    self.notification = Some((format!("Renaming to '{new_name}'..."), 30));
                 }
                 InputResult::Cancel => { main.popup = None; }
                 InputResult::Continue => {}
@@ -1418,13 +1488,14 @@ impl App {
                     }
                 });
             }
-            PendingAction::DeleteSnapshot { id, ref name } => {
+            PendingAction::DeleteSnapshot { ref id, ref name } => {
                 self.notification = Some((format!("Deleting snapshot '{name}'..."), 30));
                 let tx = tx.clone();
+                let id = id.clone();
                 std::thread::spawn(move || {
                     let cfg = config::load();
                     let api_key = cfg.do_api_key.unwrap_or_default();
-                    match digitalocean::delete_snapshot(&api_key, id) {
+                    match digitalocean::delete_snapshot(&api_key, &id) {
                         Ok(()) => { tx.send(Msg::SnapshotDeleteDone { id }).ok(); }
                         Err(e) => { tx.send(Msg::SnapshotDeleteFailed { error: e.to_string() }).ok(); }
                     }
@@ -1572,22 +1643,9 @@ impl App {
             }
 
             Msg::DropletsLoaded(droplets) => {
-                let mut start_provision = Vec::new();
                 let mut needs_check = Vec::new();
 
                 if let Screen::Main(main) = &mut self.screen {
-                    // Check which droplets just became active (created in this session)
-                    let newly_active: Vec<String> = {
-                        let views = main.droplets.registry.views();
-                        droplets.iter().filter(|d| {
-                            d.status == "active"
-                                && views.iter().any(|v| {
-                                    v.name == d.name
-                                        && v.local_status == LocalStatus::Creating
-                                })
-                        }).map(|d| d.name.clone()).collect()
-                    };
-
                     main.droplets.registry.merge_api_data(droplets);
                     main.droplets.loading = false;
 
@@ -1597,9 +1655,8 @@ impl App {
                         main.droplets.selected = total.saturating_sub(1);
                     }
 
-                    start_provision = newly_active;
-
-                    // Collect droplets that need remote state check (newly discovered active)
+                    // Collect droplets that need remote state check
+                    // (both newly created and newly discovered active droplets)
                     needs_check = main.droplets.registry.views()
                         .iter()
                         .filter(|v| {
@@ -1622,9 +1679,6 @@ impl App {
                     }
                 }
 
-                for name in start_provision {
-                    self.start_provisioning(&name, tx);
-                }
                 for (name, ip) in needs_check {
                     self.spawn_provision_check(&name, &ip, tx);
                 }
@@ -1648,6 +1702,24 @@ impl App {
                     }
                 }
                 self.notification = Some((format!("Delete failed: {error}"), 50));
+            }
+
+            Msg::DropletRenameDone { id, new_name } => {
+                if let Screen::Main(main) = &mut self.screen {
+                    if let Some(view) = main.droplets.registry.views.iter_mut().find(|v| {
+                        v.api.as_ref().map_or(false, |a| a.id == id)
+                    }) {
+                        view.name = new_name.clone();
+                        if let Some(api) = &mut view.api {
+                            api.name = new_name.clone();
+                        }
+                    }
+                }
+                self.notification = Some((format!("Renamed to '{new_name}'"), 30));
+            }
+
+            Msg::DropletRenameFailed { error } => {
+                self.notification = Some((format!("Rename failed: {error}"), 50));
             }
 
             Msg::ProvisionStepDone { name, step_idx } => {
@@ -1724,19 +1796,39 @@ impl App {
 
             Msg::SnapshotsLoaded(snapshots) => {
                 if let Screen::Main(main) = &mut self.screen {
+                    // Check if any pending snapshots have appeared
+                    let mut completed = Vec::new();
+                    main.snapshots.pending.retain(|name| {
+                        if snapshots.iter().any(|s| s.name == *name) {
+                            completed.push(name.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    for name in &completed {
+                        self.notification = Some((format!("Snapshot '{name}' ready"), 50));
+                    }
+
                     main.snapshots.list = snapshots;
                     main.snapshots.loading = false;
                     if main.snapshots.selected >= main.snapshots.list.len() && !main.snapshots.list.is_empty() {
                         main.snapshots.selected = main.snapshots.list.len() - 1;
                     }
+
+                    // Poll faster while snapshots are pending
+                    if !main.snapshots.pending.is_empty() {
+                        main.snapshots.refresh_countdown = REFRESH_INTERVAL_TICKS;
+                    }
                 }
             }
 
             Msg::SnapshotCreateDone { name } => {
-                self.notification = Some((format!("Snapshot '{name}' creation started"), 50));
-                // Force refresh snapshots
+                self.notification = Some((format!("Snapshot '{name}' in progress..."), 50));
                 if let Screen::Main(main) = &mut self.screen {
-                    main.snapshots.refresh_countdown = 0;
+                    main.snapshots.pending.push(name);
+                    // Poll faster while creating
+                    main.snapshots.refresh_countdown = REFRESH_INTERVAL_TICKS;
                 }
             }
 
@@ -1756,6 +1848,18 @@ impl App {
 
             Msg::SnapshotDeleteFailed { error } => {
                 self.notification = Some((format!("Delete snapshot failed: {error}"), 50));
+            }
+
+            Msg::SnapshotRenameDone { id, new_name } => {
+                if let Screen::Main(main) = &mut self.screen {
+                    if let Some(snap) = main.snapshots.list.iter_mut().find(|s| s.id == id) {
+                        snap.name = new_name;
+                    }
+                }
+            }
+
+            Msg::SnapshotRenameFailed { error } => {
+                self.notification = Some((format!("Rename failed: {error}"), 50));
             }
 
             Msg::ConfigGithubCheck { success, message } => {

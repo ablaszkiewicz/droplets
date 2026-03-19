@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct SnapshotInfo {
-    pub id: i64,
+    pub id: String,
     pub name: String,
     pub created_at: String,
     pub size_gigabytes: f64,
@@ -178,10 +178,10 @@ impl DropletRegistry {
                     LocalStatus::Creating => {
                         if api.status == "active" {
                             view.local_status = LocalStatus::Normal;
-                            // Start provisioning if not already started
+                            // Check markers via SSH to detect what's already done
+                            // (important for snapshot-based droplets)
                             if view.provision.current.is_none() && !view.provision.is_done() {
-                                view.provision.current = Some(0);
-                                view.provision.steps[0].status = StepStatus::Running;
+                                view.provision.needs_check = true;
                             }
                         }
                     }

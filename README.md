@@ -11,7 +11,7 @@ Generate a personal access token at https://cloud.digitalocean.com/account/api/t
 The token needs the following permissions:
 
 - **Droplet** — Create, Read, Delete
-- **Image** — Create
+- **Image** — Create, Read
 - **Snapshot** — Read, Delete
 - **SSH Key** — Read, Create
 - **Account** — Read

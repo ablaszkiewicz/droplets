@@ -214,7 +214,7 @@ pub fn draw(f: &mut Frame, state: &WelcomeState, spin: usize) {
                 Style::default().fg(Color::DarkGray),
             ));
             lines.push(Line::styled(
-                "  image:create, snapshot:read/delete, ssh_key:create/read",
+                "  image:create/read, snapshot:read/delete, ssh_key:create/read",
                 Style::default().fg(Color::DarkGray),
             ));
             footer_lines.push(Line::styled(
