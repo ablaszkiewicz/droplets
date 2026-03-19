@@ -44,6 +44,7 @@ pub enum Msg {
     ProvisionStepFailed { name: String, step_idx: usize, error: String },
     ProvisionLog { name: String, step_idx: usize, line: String },
     ProvisionStateChecked { name: String, completed_steps: Vec<bool> },
+    ProvisionCheckFailed { name: String },
 
     // Main: Snapshots
     SnapshotsLoaded(Vec<SnapshotInfo>),
@@ -1784,6 +1785,18 @@ Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
                 }
             }
 
+            Msg::ProvisionCheckFailed { name } => {
+                // SSH check failed (droplet not ready yet) — re-flag so next
+                // DropletsLoaded cycle retries the check.
+                if let Screen::Main(main) = &mut self.screen {
+                    if let Some(view) = main.droplets.registry.find_by_name_mut(&name) {
+                        if view.provision.current.is_none() && !view.provision.is_done() {
+                            view.provision.needs_check = true;
+                        }
+                    }
+                }
+            }
+
             Msg::SnapshotsLoaded(snapshots) => {
                 if let Screen::Main(main) = &mut self.screen {
                     // Check if any pending snapshots have appeared
@@ -1949,9 +1962,8 @@ Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
                     .ok();
                 }
                 Err(_) => {
-                    // SSH failed — could be droplet not ready. Will be retried
-                    // if needs_check gets set again (won't by default, so the
-                    // droplet stays in "pending" state).
+                    // SSH failed — droplet likely not ready yet. Re-flag for retry.
+                    tx.send(Msg::ProvisionCheckFailed { name }).ok();
                 }
             }
         });
