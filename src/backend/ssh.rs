@@ -146,66 +146,6 @@ pub fn test_do_api_key(api_key: &str) -> (bool, String) {
     }
 }
 
-// ── /etc/hosts + pfctl mapping ──────────────────────────────────────────────
-
-pub fn is_host_mapped(name: &str) -> bool {
-    let Ok(hosts) = std::fs::read_to_string("/etc/hosts") else { return false };
-    let pattern = format!("{name}.droplet");
-    hosts.lines().any(|line| {
-        let trimmed = line.trim();
-        !trimmed.starts_with('#') && trimmed.ends_with(&pattern)
-    })
-}
-
-/// Map or unmap `<name>.droplet` via /etc/hosts.
-/// Uses osascript for admin privileges (macOS password dialog).
-/// Returns `true` if now mapped, `false` if unmapped.
-pub fn toggle_host_mapping(name: &str, _local_port: u16) -> Result<bool> {
-    let mapped = is_host_mapped(name);
-
-    let script = if mapped {
-        format!(
-            r#"do shell script "sed -i '' '/{}\\.droplet/d' /etc/hosts; dscacheutil -flushcache && killall -HUP mDNSResponder" with administrator privileges"#,
-            name
-        )
-    } else {
-        format!(
-            r#"do shell script "echo '127.0.0.1 {name}.droplet' >> /etc/hosts; dscacheutil -flushcache && killall -HUP mDNSResponder" with administrator privileges"#,
-        )
-    };
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("cancelled") {
-            bail!("Cancelled by user");
-        }
-        bail!("{}", stderr.trim());
-    }
-
-    Ok(!mapped)
-}
-
-/// Configure Caddy on the remote droplet to accept any hostname.
-/// Replaces `http://localhost:8000` with `:8000` (accept any Host) and adds
-/// `request_header Host localhost` so upstream services see a known-good Host.
-pub fn configure_caddy_any_host(droplet_key: &str, ip: &str) -> Result<()> {
-    ssh_run(
-        droplet_key,
-        ip,
-        "docker exec $(docker ps -qf name=proxy) sh -c \"\
-         sed -i 's|http://localhost:8000|:8000|' /etc/caddy/Caddyfile; \
-         grep -q 'request_header Host' /etc/caddy/Caddyfile || \
-         sed -i 's/:8000 {/:8000 {\\n    request_header Host localhost/' /etc/caddy/Caddyfile; \
-         caddy reload -c /etc/caddy/Caddyfile\"",
-    )?;
-    Ok(())
-}
-
 // ── Clipboard / Terminal ────────────────────────────────────────────────────
 
 pub fn copy_to_clipboard(text: &str) -> bool {
@@ -222,33 +162,6 @@ pub fn copy_to_clipboard(text: &str) -> bool {
         }
         Err(_) => false,
     }
-}
-
-pub fn start_port_forward(
-    key_path: &str,
-    ip: &str,
-    local_port: u16,
-) -> Result<std::process::Child> {
-    let child = Command::new("ssh")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .arg("-i")
-        .arg(key_path)
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ServerAliveInterval=30")
-        .arg("-o")
-        .arg("ServerAliveCountMax=3")
-        .arg("-N")
-        .arg("-L")
-        .arg(format!("127.0.0.1:{local_port}:localhost:8010"))
-        .arg(format!("root@{ip}"))
-        .spawn()?;
-    Ok(child)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -416,11 +329,16 @@ fn ssh_run_logged(
 
 // ── Provision marker system ─────────────────────────────────────────────────
 
+fn provision_marker_filename(step_idx: usize) -> String {
+    format!("step-{step_idx}.done")
+}
+
 fn write_provision_marker(droplet_key: &str, ip: &str, step_idx: usize) -> Result<()> {
+    let fname = provision_marker_filename(step_idx);
     ssh_run(
         droplet_key,
         ip,
-        &format!("mkdir -p /root/.droplets && touch /root/.droplets/step-{step_idx}.done"),
+        &format!("mkdir -p /root/.droplets && touch /root/.droplets/{fname}"),
     )?;
     Ok(())
 }
@@ -433,9 +351,18 @@ pub fn check_provision_markers(
     let output = ssh_run(droplet_key, ip, "ls /root/.droplets/ 2>/dev/null || echo ''")?;
     let mut results = vec![false; total_steps];
     for i in 0..total_steps {
-        if output.contains(&format!("step-{i}.done")) {
+        let fname = provision_marker_filename(i);
+        if output.contains(&fname) {
             results[i] = true;
         }
+    }
+    // Pull (step 10) used to leave no marker; treat as done if Flox (11) already completed.
+    if total_steps > 11 && !results[10] && results[11] {
+        results[10] = true;
+    }
+    // Flox (11): treat as done if tmux hogli (12) already completed.
+    if total_steps > 12 && !results[11] && results[12] {
+        results[11] = true;
     }
     Ok(results)
 }
@@ -617,7 +544,6 @@ pub fn provision_verify_posthog_clone(
 }
 
 /// Step 10: Pull latest main (only if current branch is master/main).
-/// No marker — always re-runs on rediscovery so snapshot-based droplets get updates.
 /// Skips if the user has switched to a different branch (work in progress).
 pub fn provision_pull_latest_main(
     droplet_key: &str,
@@ -636,7 +562,7 @@ pub fn provision_pull_latest_main(
          fi",
         on_log,
     )?;
-    // Intentionally no marker — this step always re-runs
+    write_provision_marker(droplet_key, ip, 10)?;
     Ok(())
 }
 
@@ -656,52 +582,60 @@ pub fn provision_flox_activate(
     Ok(())
 }
 
-/// Step 12: Install tmux (needed for persistent hogli session).
-pub fn provision_install_tmux(
+/// Step 12: Ensure detached tmux session `hogli` running hogli under Flox (idempotent).
+///
+/// `flox activate -- hogli …` does not work: `hogli` is only on PATH after interactive
+/// activation finishes. We run `flox activate` in the pane, poll output until Flox reports
+/// readiness (`You are now using the environment`), then send `hogli start --phrocs`.
+///
+/// When `force_recreate` is true (manual “Re-run pull + Flox + tmux”), an existing `hogli`
+/// session is killed first so the pane is rebuilt from scratch.
+pub fn provision_ensure_tmux_hogli(
     droplet_key: &str,
     ip: &str,
     on_log: &dyn Fn(&str),
+    force_recreate: bool,
 ) -> Result<()> {
-    ssh_run_logged(
-        droplet_key,
-        ip,
-        "which tmux >/dev/null 2>&1 && echo 'tmux already installed' || \
-         (apt-get update -qq && apt-get install -y -qq tmux && echo 'tmux installed')",
-        on_log,
-    )?;
-    write_provision_marker(droplet_key, ip, 12)?;
-    Ok(())
-}
+    let kill_existing = if force_recreate {
+        r#"if tmux has-session -t hogli 2>/dev/null; then
+  echo 'removing existing tmux session hogli'
+  tmux kill-session -t hogli
+fi
 
-/// Step 13: Start hogli inside a detached tmux session.
-pub fn provision_start_hogli(
-    droplet_key: &str,
-    ip: &str,
-    on_log: &dyn Fn(&str),
-) -> Result<()> {
-    // Kill any existing session, then start fresh.
-    // remain-on-exit keeps the tmux window alive if the command crashes.
-    // flox activate modifies the current shell, so we must send it as keystrokes
-    // and wait for it to finish (the prompt changes to "flox [") before sending
-    // hogli start.
-    ssh_run_logged(
-        droplet_key,
-        ip,
-        "tmux kill-session -t hogli 2>/dev/null; \
-         tmux new-session -d -s hogli -c /root/posthog && \
-         tmux set-option -t hogli remain-on-exit on && \
-         tmux send-keys -t hogli 'flox activate' Enter && \
-         echo 'Waiting for flox to activate...' && \
-         for i in $(seq 1 120); do \
-           if tmux capture-pane -t hogli -p | grep -q 'flox \\['; then \
-             echo 'Flox activated'; break; \
-           fi; \
-           sleep 1; \
-         done && \
-         tmux send-keys -t hogli 'hogli start' Enter && \
-         echo 'hogli tmux session started'",
-        on_log,
-    )?;
-    write_provision_marker(droplet_key, ip, 13)?;
+"#
+    } else {
+        ""
+    };
+
+    let script = format!(
+        r##"if ! command -v tmux >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive && apt-get update -qq && apt-get install -y -qq tmux
+fi
+{}if tmux has-session -t hogli 2>/dev/null; then
+  echo 'tmux session hogli already exists'
+else
+  tmux new-session -d -s hogli -c /root/posthog
+  tmux send-keys -t hogli 'flox activate' Enter
+  i=0
+  while [ "$i" -lt 600 ]; do
+    if tmux capture-pane -t hogli -p -S - 2>/dev/null | tail -n 120 | grep -q 'You are now using the environment'; then
+      break
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  if [ "$i" -ge 600 ]; then
+    echo 'timed out waiting for flox activate (expected: You are now using the environment)' >&2
+    exit 1
+  fi
+  tmux send-keys -t hogli 'hogli start --phrocs; exec bash' Enter
+  echo 'started tmux session hogli'
+fi
+"##,
+        kill_existing
+    );
+
+    ssh_run_logged(droplet_key, ip, &script, on_log)?;
+    write_provision_marker(droplet_key, ip, 12)?;
     Ok(())
 }

@@ -32,23 +32,6 @@ pub struct DropletView {
     pub name: String,
     pub local_status: LocalStatus,
     pub provision: ProvisionState,
-    pub port_forward: PortForwardInfo,
-    pub hosts_mapped: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct PortForwardInfo {
-    pub local_port: u16,
-    pub active: bool,
-}
-
-impl PortForwardInfo {
-    pub fn new() -> Self {
-        Self {
-            local_port: 28000,
-            active: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,8 +78,7 @@ pub const PROVISION_STEP_NAMES: &[&str] = &[
     "Verify PostHog clone",
     "Pull latest main",
     "Activate Flox environment",
-    "Install tmux",
-    "Start hogli",
+    "Ensure tmux hogli session",
 ];
 
 impl ProvisionState {
@@ -226,8 +208,6 @@ impl DropletRegistry {
                     api: Some(api),
                     local_status: LocalStatus::Normal,
                     provision: ps,
-                    port_forward: PortForwardInfo::new(),
-                    hosts_mapped: false,
                 });
             }
         }
@@ -239,8 +219,6 @@ impl DropletRegistry {
             api: None,
             local_status: LocalStatus::Creating,
             provision: ProvisionState::new(),
-            port_forward: PortForwardInfo::new(),
-            hosts_mapped: false,
         });
     }
 

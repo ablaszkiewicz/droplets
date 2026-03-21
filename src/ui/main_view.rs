@@ -5,7 +5,10 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::*;
-use crate::types::{time_ago, seconds_since, hourly_price_for_size, snapshot_monthly_cost, LocalStatus, StepStatus, SPINNER};
+use crate::types::{
+    hourly_price_for_size, seconds_since, snapshot_monthly_cost, time_ago, LocalStatus,
+    StepStatus, PROVISION_STEP_NAMES, SPINNER,
+};
 
 pub fn draw(
     f: &mut Frame,
@@ -326,19 +329,6 @@ fn draw_detail_info_window(
         let mut action_idx = 0;
 
         if view.api.as_ref().and_then(|a| a.ip.as_ref()).is_some() {
-            let attach_style = if focused && ds.detail_selected == action_idx {
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled("Attach to hogli", attach_style),
-            ]));
-            action_idx += 1;
-
             let shell_style = if focused && ds.detail_selected == action_idx {
                 Style::default()
                     .fg(Color::White)
@@ -348,29 +338,20 @@ fn draw_detail_info_window(
             };
             lines.push(Line::from(vec![
                 Span::raw(" "),
-                Span::styled("Open shell", shell_style),
+                Span::styled("Copy SSH command", shell_style),
             ]));
             action_idx += 1;
 
-            // Map .droplet hosts entry
-            let hosts_mapped = view.hosts_mapped;
-            let hosts_label = if hosts_mapped {
-                format!("Unmap {}.droplet", view.name)
-            } else {
-                format!("Map {}.droplet", view.name)
-            };
-            let hosts_color = if hosts_mapped { Color::Green } else { Color::White };
-            let hosts_style = if focused && ds.detail_selected == action_idx {
+            let tmux_style = if focused && ds.detail_selected == action_idx {
                 Style::default()
-                    .fg(hosts_color)
+                    .fg(Color::White)
                     .add_modifier(Modifier::REVERSED)
             } else {
-                Style::default().fg(hosts_color)
+                Style::default().fg(Color::White)
             };
-            let hosts_icon = if hosts_mapped { "● " } else { "  " };
             lines.push(Line::from(vec![
-                Span::styled(hosts_icon, Style::default().fg(Color::Green)),
-                Span::styled(hosts_label, hosts_style),
+                Span::raw(" "),
+                Span::styled("Copy SSH (attach tmux hogli)", tmux_style),
             ]));
             action_idx += 1;
 
@@ -441,6 +422,7 @@ fn draw_detail_provision_window(
 
     let mut lines: Vec<Line> = Vec::new();
 
+    let step_count = view.provision.steps.len();
     for (i, step) in view.provision.steps.iter().enumerate() {
         let (icon, color) = match &step.status {
             StepStatus::Pending => ("○", Color::DarkGray),
@@ -486,6 +468,24 @@ fn draw_detail_provision_window(
         }
     }
 
+    lines.push(Line::raw(""));
+    let btn_selected = focused && ds.provision_selected == step_count;
+    let btn_style = if btn_selected {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled("Re-run pull + Flox + tmux", btn_style),
+    ]));
+    lines.push(Line::styled(
+        "   (Enter — only when no step is running)",
+        Style::default().fg(Color::DarkGray),
+    ));
+
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -498,7 +498,13 @@ fn draw_detail_log_window(
 ) {
     // Determine which step's logs to show
     let step_idx = if ds.focus == DFocus::DetailProvision {
-        ds.provision_selected
+        let sel = ds.provision_selected;
+        if sel < view.provision.steps.len() {
+            sel
+        } else {
+            // Manual-action row selected — show pull step logs by default
+            10_usize.min(view.provision.steps.len().saturating_sub(1))
+        }
     } else {
         view.provision.most_recent_step()
     };
@@ -853,16 +859,21 @@ fn draw_footer(
             ],
             DFocus::DetailProvision => {
                 let mut b = vec![("↑↓", "select step")];
-                // Show restart hint if selected step has failed
-                let has_failure = state
-                    .droplets
-                    .registry
-                    .get_by_index(state.droplets.selected)
-                    .and_then(|v| v.provision.steps.get(state.droplets.provision_selected))
-                    .map(|s| matches!(s.status, StepStatus::Failed(_)))
-                    .unwrap_or(false);
-                if has_failure {
-                    b.push(("R", "restart"));
+                let step_count = PROVISION_STEP_NAMES.len();
+                let sel = state.droplets.provision_selected;
+                if sel < step_count {
+                    let has_failure = state
+                        .droplets
+                        .registry
+                        .get_by_index(state.droplets.selected)
+                        .and_then(|v| v.provision.steps.get(sel))
+                        .map(|s| matches!(s.status, StepStatus::Failed(_)))
+                        .unwrap_or(false);
+                    if has_failure {
+                        b.push(("R", "restart"));
+                    }
+                } else {
+                    b.push(("Enter", "pull + Flox + tmux"));
                 }
                 b.extend_from_slice(&[("←", "back"), ("D", "delete"), ("q", "quit")]);
                 b

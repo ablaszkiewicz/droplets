@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -36,8 +35,6 @@ pub enum Msg {
     DropletDeleteFailed { id: i64, error: String },
     DropletRenameDone { id: i64, new_name: String },
     DropletRenameFailed { error: String },
-    HostsMappingDone { name: String, mapped: bool },
-    HostsMappingFailed { error: String },
 
     // Provisioning
     ProvisionStepDone { name: String, step_idx: usize },
@@ -45,6 +42,15 @@ pub enum Msg {
     ProvisionLog { name: String, step_idx: usize, line: String },
     ProvisionStateChecked { name: String, completed_steps: Vec<bool> },
     ProvisionCheckFailed { name: String },
+    /// Manual re-run of pull + Flox + tmux (steps 10–12) finished.
+    ProvisionPullFloxFinished {
+        name: String,
+        error: Option<(usize, String)>,
+    },
+    /// Pull step finished during manual re-run; Flox is starting next.
+    ProvisionPullFloxPullOk { name: String },
+    /// Flox step finished during manual re-run; tmux hogli is starting next.
+    ProvisionPullFloxFloxOk { name: String },
 
     // Main: Snapshots
     SnapshotsLoaded(Vec<SnapshotInfo>),
@@ -141,7 +147,6 @@ pub struct DropletsState {
     pub provision_selected: usize,
     pub refresh_countdown: u32,
     pub loading: bool,
-    pub tunnels: HashMap<String, std::process::Child>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -409,19 +414,6 @@ impl App {
                     do_check_do = true;
                 }
 
-                // Check tunnel health: detect dead SSH tunnel processes
-                let mut dead_tunnels = Vec::new();
-                for (name, child) in main.droplets.tunnels.iter_mut() {
-                    if let Ok(Some(_)) = child.try_wait() {
-                        dead_tunnels.push(name.clone());
-                    }
-                }
-                for name in &dead_tunnels {
-                    main.droplets.tunnels.remove(name);
-                    if let Some(view) = main.droplets.registry.find_by_name_mut(name) {
-                        view.port_forward.active = false;
-                    }
-                }
             }
         }
 
@@ -491,7 +483,6 @@ impl App {
                 provision_selected: 0,
                 refresh_countdown: 0,
                 loading: true,
-                tunnels: HashMap::new(),
             },
             snapshots: SnapshotsState {
                 list: Vec::new(),
@@ -786,7 +777,11 @@ Some(Popup::SnapshotName { .. }) => true,
 
         let action_count = if let Some(view) = ds.registry.get_by_index(ds.selected) {
             if let Some(api) = &view.api {
-                if api.ip.is_some() { 6 } else { 1 } // Copy SSH, Open SSH, .droplet, Snapshot, Rename, Delete
+                if api.ip.is_some() {
+                    5
+                } else {
+                    1
+                } // SSH, attach tmux, Snapshot, Rename, Delete
             } else {
                 0
             }
@@ -823,20 +818,6 @@ Some(Popup::SnapshotName { .. }) => true,
                 let ip = api.ip.clone();
 
                 if has_ip && ds.detail_selected == 0 {
-                    // Copy "attach to hogli" command
-                    if let Some(ip) = ip {
-                        let cfg = config::load();
-                        let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
-                        let cmd = format!(
-                            "ssh -i {key_path} -o StrictHostKeyChecking=accept-new -t root@{ip} 'tmux attach -t hogli'"
-                        );
-                        let copied = ssh::copy_to_clipboard(&cmd);
-                        self.notification = Some((
-                            if copied { format!("Copied: {cmd}") } else { cmd },
-                            30,
-                        ));
-                    }
-                } else if has_ip && ds.detail_selected == 1 {
                     // Copy "open shell" command
                     if let Some(ip) = ip {
                         let cfg = config::load();
@@ -850,72 +831,27 @@ Some(Popup::SnapshotName { .. }) => true,
                             30,
                         ));
                     }
-                } else if has_ip && ds.detail_selected == 2 {
-                    // Toggle .droplet hosts mapping + auto-start/stop port forward + configure Caddy
-                    if let Some(ref ip) = ip {
-                        let dname = droplet_name.clone();
-                        let ip_for_thread = ip.clone();
-                        let tx = _tx.clone();
-                        let is_currently_mapped = ds.registry.get_by_index(ds.selected)
-                            .map(|v| v.hosts_mapped)
-                            .unwrap_or(false);
-                        let local_port = ds.registry.get_by_index(ds.selected)
-                            .map(|v| v.port_forward.local_port)
-                            .unwrap_or(28000);
-                        let dname_for_thread = dname.clone();
-                        std::thread::spawn(move || {
-                            match ssh::toggle_host_mapping(&dname_for_thread, local_port) {
-                                Ok(mapped) => {
-                                    // If mapping ON, also configure Caddy to accept any host
-                                    if mapped {
-                                        let cfg = config::load();
-                                        let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
-                                        if let Err(e) = ssh::configure_caddy_any_host(&key_path, &ip_for_thread) {
-                                            tx.send(Msg::HostsMappingFailed { error: format!("Caddy config failed: {e}") }).ok();
-                                            return;
-                                        }
-                                    }
-                                    tx.send(Msg::HostsMappingDone { name: dname_for_thread, mapped }).ok();
-                                }
-                                Err(e) => { tx.send(Msg::HostsMappingFailed { error: e.to_string() }).ok(); }
-                            }
-                        });
-                        if !is_currently_mapped {
-                            // Mapping ON: auto-start port forwarding if not already active
-                            let is_active = ds.registry.get_by_index(ds.selected)
-                                .map(|v| v.port_forward.active)
-                                .unwrap_or(false);
-                            if !is_active {
-                                let cfg = config::load();
-                                let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
-                                match ssh::start_port_forward(&key_path, ip, local_port) {
-                                    Ok(child) => {
-                                        ds.tunnels.insert(droplet_name.clone(), child);
-                                        if let Some(view) = ds.registry.get_by_index_mut(ds.selected) {
-                                            view.port_forward.active = true;
-                                        }
-                                    }
-                                    Err(_) => {}
-                                }
-                            }
-                        } else {
-                            // Mapping OFF: also stop port forwarding
-                            if let Some(mut child) = ds.tunnels.remove(&dname) {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                            }
-                            if let Some(view) = ds.registry.get_by_index_mut(ds.selected) {
-                                view.port_forward.active = false;
-                            }
-                        }
+                } else if has_ip && ds.detail_selected == 1 {
+                    // Copy attach to tmux hogli (needs TTY)
+                    if let Some(ip) = ip {
+                        let cfg = config::load();
+                        let key_path = cfg.droplet_ssh_key_path.unwrap_or_default();
+                        let cmd = format!(
+                            "ssh -i {key_path} -o StrictHostKeyChecking=accept-new -t root@{ip} tmux attach -t hogli"
+                        );
+                        let copied = ssh::copy_to_clipboard(&cmd);
+                        self.notification = Some((
+                            if copied { format!("Copied: {cmd}") } else { cmd },
+                            30,
+                        ));
                     }
-                } else if has_ip && ds.detail_selected == 3 {
+                } else if has_ip && ds.detail_selected == 2 {
                     // Snapshot this droplet
                     main.popup = Some(Popup::SnapshotName {
                         droplet_id,
                         input: TextInput::new(&format!("{}-snapshot", droplet_name), false),
                     });
-                } else if has_ip && ds.detail_selected == 4 {
+                } else if has_ip && ds.detail_selected == 3 {
                     // Rename droplet
                     main.popup = Some(Popup::RenameDroplet {
                         droplet_id,
@@ -953,6 +889,8 @@ Some(Popup::SnapshotName { .. }) => true,
         let Screen::Main(main) = &mut self.screen else { return };
         let ds = &mut main.droplets;
         let step_count = PROVISION_STEP_NAMES.len();
+        // Last row: manual "Re-run pull + Flox + tmux"
+        let row_count = step_count + 1;
 
         match key.code {
             KeyCode::Left | KeyCode::Esc => {
@@ -968,9 +906,45 @@ Some(Popup::SnapshotName { .. }) => true,
                 }
             }
             KeyCode::Down => {
-                if ds.provision_selected + 1 < step_count {
+                if ds.provision_selected + 1 < row_count {
                     ds.provision_selected += 1;
                 }
+            }
+            KeyCode::Enter => {
+                if ds.provision_selected != step_count {
+                    return;
+                }
+                let Some(view) = ds.registry.get_by_index_mut(ds.selected) else { return };
+                if view.provision.current.is_some() {
+                    self.notification = Some((
+                        "Wait for in-progress provisioning to finish".to_string(),
+                        40,
+                    ));
+                    return;
+                }
+                let Some(api) = &view.api else { return };
+                let Some(ip) = api.ip.clone() else { return };
+                let name = view.name.clone();
+                if let Some(step) = view.provision.steps.get_mut(10) {
+                    step.status = StepStatus::Running;
+                }
+                if let Some(step) = view.provision.steps.get_mut(11) {
+                    step.status = StepStatus::Pending;
+                }
+                if let Some(step) = view.provision.steps.get_mut(12) {
+                    step.status = StepStatus::Pending;
+                }
+                view.provision.error = None;
+                if let Some(logs) = view.provision.step_logs.get_mut(10) {
+                    logs.clear();
+                }
+                if let Some(logs) = view.provision.step_logs.get_mut(11) {
+                    logs.clear();
+                }
+                if let Some(logs) = view.provision.step_logs.get_mut(12) {
+                    logs.clear();
+                }
+                self.spawn_provision_pull_flox(&name, &ip, tx);
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 let selected_step = ds.provision_selected;
@@ -1429,13 +1403,8 @@ Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
 
     fn execute_pending_action(&mut self, action: PendingAction, tx: &Sender<Msg>) {
         match action {
-            PendingAction::DeleteDroplet { id, ref name } => {
+            PendingAction::DeleteDroplet { id, .. } => {
                 if let Screen::Main(main) = &mut self.screen {
-                    // Kill tunnel if active
-                    if let Some(mut child) = main.droplets.tunnels.remove(name) {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
                     main.droplets.registry.mark_deleting(id);
                     main.droplets.focus = DFocus::DetailInfo;
                 }
@@ -1644,10 +1613,6 @@ Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
                         }
                     }
 
-                    // Sync hosts mapping state from /etc/hosts
-                    for view in main.droplets.registry.views.iter_mut() {
-                        view.hosts_mapped = ssh::is_host_mapped(&view.name);
-                    }
                 }
 
                 for (name, ip) in needs_check {
@@ -1691,33 +1656,6 @@ Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
 
             Msg::DropletRenameFailed { error } => {
                 self.notification = Some((format!("Rename failed: {error}"), 50));
-            }
-
-            Msg::HostsMappingDone { name, mapped } => {
-                if let Screen::Main(main) = &mut self.screen {
-                    if let Some(view) = main.droplets.registry.find_by_name_mut(&name) {
-                        view.hosts_mapped = mapped;
-                    }
-                    if mapped {
-                        let port = main.droplets.registry.views().iter()
-                            .find(|v| v.name == name)
-                            .map(|v| v.port_forward.local_port)
-                            .unwrap_or(28000);
-                        self.notification = Some((
-                            format!("http://{name}.droplet:{port} ready"),
-                            50,
-                        ));
-                    } else {
-                        self.notification = Some((
-                            format!("{name}.droplet removed from /etc/hosts"),
-                            30,
-                        ));
-                    }
-                }
-            }
-
-            Msg::HostsMappingFailed { error } => {
-                self.notification = Some((format!("Hosts mapping failed: {error}"), 50));
             }
 
             Msg::ProvisionStepDone { name, step_idx } => {
@@ -1799,6 +1737,67 @@ Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
                     if let Some(view) = main.droplets.registry.find_by_name_mut(&name) {
                         if view.provision.current.is_none() && !view.provision.is_done() {
                             view.provision.needs_check = true;
+                        }
+                    }
+                }
+            }
+
+            Msg::ProvisionPullFloxPullOk { name } => {
+                if let Screen::Main(main) = &mut self.screen {
+                    if let Some(view) = main.droplets.registry.find_by_name_mut(&name) {
+                        if let Some(step) = view.provision.steps.get_mut(10) {
+                            step.status = StepStatus::Done;
+                        }
+                        if let Some(step) = view.provision.steps.get_mut(11) {
+                            step.status = StepStatus::Running;
+                        }
+                        if let Some(step) = view.provision.steps.get_mut(12) {
+                            step.status = StepStatus::Pending;
+                        }
+                    }
+                }
+            }
+
+            Msg::ProvisionPullFloxFloxOk { name } => {
+                if let Screen::Main(main) = &mut self.screen {
+                    if let Some(view) = main.droplets.registry.find_by_name_mut(&name) {
+                        if let Some(step) = view.provision.steps.get_mut(11) {
+                            step.status = StepStatus::Done;
+                        }
+                        if let Some(step) = view.provision.steps.get_mut(12) {
+                            step.status = StepStatus::Running;
+                        }
+                    }
+                }
+            }
+
+            Msg::ProvisionPullFloxFinished { name, error } => {
+                if let Screen::Main(main) = &mut self.screen {
+                    if let Some(view) = main.droplets.registry.find_by_name_mut(&name) {
+                        view.provision.current = None;
+                        match error {
+                            None => {
+                                if let Some(step) = view.provision.steps.get_mut(10) {
+                                    step.status = StepStatus::Done;
+                                }
+                                if let Some(step) = view.provision.steps.get_mut(11) {
+                                    step.status = StepStatus::Done;
+                                }
+                                if let Some(step) = view.provision.steps.get_mut(12) {
+                                    step.status = StepStatus::Done;
+                                }
+                                view.provision.error = None;
+                                self.notification =
+                                    Some(("Pull + Flox + tmux finished".to_string(), 40));
+                            }
+                            Some((idx, err)) => {
+                                if let Some(step) = view.provision.steps.get_mut(idx) {
+                                    step.status = StepStatus::Failed(err.clone());
+                                }
+                                view.provision.error = Some(err.clone());
+                                self.notification =
+                                    Some((format!("Pull/Flox/tmux failed: {err}"), 60));
+                            }
                         }
                     }
                 }
@@ -1932,8 +1931,7 @@ Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
                 9 => ssh::provision_verify_posthog_clone(&droplet_key, &ip, &on_log),
                 10 => ssh::provision_pull_latest_main(&droplet_key, &ip, &on_log),
                 11 => ssh::provision_flox_activate(&droplet_key, &ip, &on_log),
-                12 => ssh::provision_install_tmux(&droplet_key, &ip, &on_log),
-                13 => ssh::provision_start_hogli(&droplet_key, &ip, &on_log),
+                12 => ssh::provision_ensure_tmux_hogli(&droplet_key, &ip, &on_log, false),
                 _ => Ok(()),
             };
 
@@ -1946,6 +1944,101 @@ Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
                         name,
                         step_idx,
                         error: e.to_string(),
+                    })
+                    .ok();
+                }
+            }
+        });
+    }
+
+    /// Re-run steps 10–12 (pull, Flox activate, tmux hogli); for manual refresh.
+    fn spawn_provision_pull_flox(&self, name: &str, ip: &str, tx: &Sender<Msg>) {
+        let name = name.to_string();
+        let ip = ip.to_string();
+        let tx = tx.clone();
+        let cfg = config::load();
+        let droplet_key = cfg.droplet_ssh_key_path.unwrap_or_default();
+
+        std::thread::spawn(move || {
+            let log_name = name.clone();
+            let log_tx = tx.clone();
+            let on_pull = move |line: &str| {
+                log_tx
+                    .send(Msg::ProvisionLog {
+                        name: log_name.clone(),
+                        step_idx: 10,
+                        line: line.to_string(),
+                    })
+                    .ok();
+            };
+            match ssh::provision_pull_latest_main(&droplet_key, &ip, &on_pull) {
+                Ok(()) => {
+                    tx.send(Msg::ProvisionPullFloxPullOk {
+                        name: name.clone(),
+                    })
+                    .ok();
+                }
+                Err(e) => {
+                    tx.send(Msg::ProvisionPullFloxFinished {
+                        name,
+                        error: Some((10, e.to_string())),
+                    })
+                    .ok();
+                    return;
+                }
+            }
+
+            let log_name = name.clone();
+            let log_tx = tx.clone();
+            let on_flox = move |line: &str| {
+                log_tx
+                    .send(Msg::ProvisionLog {
+                        name: log_name.clone(),
+                        step_idx: 11,
+                        line: line.to_string(),
+                    })
+                    .ok();
+            };
+            match ssh::provision_flox_activate(&droplet_key, &ip, &on_flox) {
+                Ok(()) => {
+                    tx.send(Msg::ProvisionPullFloxFloxOk {
+                        name: name.clone(),
+                    })
+                    .ok();
+                }
+                Err(e) => {
+                    tx.send(Msg::ProvisionPullFloxFinished {
+                        name,
+                        error: Some((11, e.to_string())),
+                    })
+                    .ok();
+                    return;
+                }
+            }
+
+            let log_name = name.clone();
+            let log_tx = tx.clone();
+            let on_tmux = move |line: &str| {
+                log_tx
+                    .send(Msg::ProvisionLog {
+                        name: log_name.clone(),
+                        step_idx: 12,
+                        line: line.to_string(),
+                    })
+                    .ok();
+            };
+            match ssh::provision_ensure_tmux_hogli(&droplet_key, &ip, &on_tmux, true) {
+                Ok(()) => {
+                    tx.send(Msg::ProvisionPullFloxFinished {
+                        name,
+                        error: None,
+                    })
+                    .ok();
+                }
+                Err(e) => {
+                    tx.send(Msg::ProvisionPullFloxFinished {
+                        name,
+                        error: Some((12, e.to_string())),
                     })
                     .ok();
                 }
@@ -2034,12 +2127,5 @@ Popup::SnapshotName { droplet_id, input } => match input.handle_key(key) {
         });
     }
 
-    pub fn cleanup(&mut self) {
-        if let Screen::Main(main) = &mut self.screen {
-            for (_, mut child) in main.droplets.tunnels.drain() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
+    pub fn cleanup(&mut self) {}
 }
